@@ -2,6 +2,8 @@ x-api: &api-common
   build:
     context: .
     dockerfile: Dockerfile
+  volumes:
+    - sockets:/sockets
   deploy:
     resources:
       limits:
@@ -21,6 +23,7 @@ services:
     cpuset: "0"
     environment:
       - SERVER_PORT=8080
+      - SOCKET_PATH=/sockets/api1.sock
     expose:
       - "8080"
 
@@ -30,6 +33,7 @@ services:
     cpuset: "1"
     environment:
       - SERVER_PORT=8080
+      - SOCKET_PATH=/sockets/api2.sock
     expose:
       - "8080"
 
@@ -41,6 +45,7 @@ services:
       - api2
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - sockets:/sockets:ro
     ports:
       - "9999:9999"
     deploy:
@@ -53,3 +58,6 @@ services:
         soft: 65535
         hard: 65535
     restart: unless-stopped
+
+volumes:
+  sockets:

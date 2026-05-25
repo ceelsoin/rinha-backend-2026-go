@@ -886,6 +886,8 @@ func cmdServe(args []string) {
 	if p := os.Getenv("SERVER_PORT"); p != "" {
 		fmt.Sscan(p, port)
 	}
+	// Unix socket path (optional; preferred over TCP when set)
+	socketPath := os.Getenv("SOCKET_PATH")
 
 	// Load config
 	var err error
@@ -915,24 +917,33 @@ func cmdServe(args []string) {
 	// Prevents OS page-fault latency spikes on first requests.
 	preWarmIndex(globalIdx)
 
-	log.Printf("[serve] listening on :%d", *port)
-
 	srv := &fasthttp.Server{
 		Handler:                       requestHandler,
 		Name:                          "rinha",
 		NoDefaultDate:                 true,
 		NoDefaultServerHeader:         true,
 		DisableHeaderNamesNormalizing: true,
-		MaxConnsPerIP:                 0,    // unlimited — LB reuses connections
-		Concurrency:                   4096, // max simultaneous goroutines; 900 req/s × ~1ms = ~1 concurrent
-		ReadBufferSize:                512,  // requests are small (~200B JSON)
-		WriteBufferSize:               256,  // responses are tiny (~40B JSON)
-		ReadTimeout:                   5000000000, // 5s in nanoseconds
+		MaxConnsPerIP:                 0,
+		Concurrency:                   4096,
+		ReadBufferSize:                512,
+		WriteBufferSize:               256,
+		ReadTimeout:                   5000000000,
 		WriteTimeout:                  5000000000,
 		TCPKeepalive:                  true,
 	}
-	if err := srv.ListenAndServe(fmt.Sprintf(":%d", *port)); err != nil {
-		log.Fatalf("server: %v", err)
+
+	if socketPath != "" {
+		// Unix domain socket: eliminate TCP stack overhead (~10-20µs per request).
+		os.Remove(socketPath) // clean up any leftover socket from previous run
+		log.Printf("[serve] listening on unix:%s", socketPath)
+		if err := srv.ListenAndServeUNIX(socketPath, 0777); err != nil {
+			log.Fatalf("server unix: %v", err)
+		}
+	} else {
+		log.Printf("[serve] listening on :%d", *port)
+		if err := srv.ListenAndServe(fmt.Sprintf(":%d", *port)); err != nil {
+			log.Fatalf("server tcp: %v", err)
+		}
 	}
 }
 
