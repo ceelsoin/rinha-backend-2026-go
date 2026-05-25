@@ -32,7 +32,8 @@ import (
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const (
-	dims         = 14   // vector dimensions
+	dims         = 14   // feature dimensions (14 input features)
+	stride       = 16   // storage stride per vector: padded to 16 int16 for 128-bit SIMD alignment
 	ivfK         = 2048 // number of IVF clusters
 	nProbe       = 4    // clusters probed per query (fast path)
 	nProbeRepair = 64   // total clusters probed when result is uncertain (8x wider repair catches boundary cases)
@@ -41,7 +42,7 @@ const (
 	trainIters   = 50
 )
 
-var ivfMagic = [8]byte{'G', 'O', 'I', 'V', 'F', '0', '2', '6'}
+var ivfMagic = [8]byte{'G', 'O', 'I', 'V', 'F', '0', '2', '7'} // v2: stride=16 (SIMD-padded)
 
 // Pre-built HTTP responses for all possible fraud counts (0..5).
 // Index = number of fraud neighbors found.
@@ -217,122 +218,9 @@ func parseTS(s []byte) (int, int, int64) {
 
 // ── IVF search ───────────────────────────────────────────────────────────────
 
-// findTopCentroids returns the nProbeRepair nearest centroid indices, sorted by distance.
-// Uses stack-allocated fixed arrays — zero heap allocations per call.
-func (idx *IVFIndex) findTopCentroids(q [dims]int16) [nProbeRepair]int {
-	type entry struct {
-		dist int64
-		c    int
-	}
-	var best [nProbeRepair]entry
-	for i := range best {
-		best[i].dist = math.MaxInt64
-		best[i].c = i
-	}
-	maxDist := int64(math.MaxInt64)
-	maxPos := 0
-
-	for c := 0; c < idx.k; c++ {
-		cent := idx.centroids[c*dims : c*dims+dims]
-		d := sqDist14(q, cent)
-		if d < maxDist {
-			best[maxPos].dist = d
-			best[maxPos].c = c
-			// Find new worst position
-			maxDist = best[0].dist
-			maxPos = 0
-			for j := 1; j < nProbeRepair; j++ {
-				if best[j].dist > maxDist {
-					maxDist = best[j].dist
-					maxPos = j
-				}
-			}
-		}
-	}
-	// Insertion sort — nProbeRepair=8 elements, faster than sort.Slice for tiny n.
-	for i := 1; i < nProbeRepair; i++ {
-		key := best[i]
-		j := i - 1
-		for j >= 0 && best[j].dist > key.dist {
-			best[j+1] = best[j]
-			j--
-		}
-		best[j+1] = key
-	}
-	var out [nProbeRepair]int
-	for i, b := range best {
-		out[i] = b.c
-	}
-	return out
-}
-
-// scanCluster updates the top-nNeigh heap by scanning cluster c.
-// maxDist and maxPos track the worst entry in the heap.
-func (idx *IVFIndex) scanCluster(c int, q [dims]int16,
-	topDists *[nNeigh]int64, topLabels *[nNeigh]uint8,
-	maxDist *int64, maxPos *int) {
-
-	off := idx.offsets[c]
-	cnt := idx.counts[c]
-	vecs := idx.vecs[off*dims : (off+cnt)*uint32(dims)]
-	lbls := idx.labels[off : off+cnt]
-
-	base := 0
-	for i := uint32(0); i < cnt; i++ {
-		d := sqDist14(q, vecs[base:base+dims])
-		if d < *maxDist {
-			topDists[*maxPos] = d
-			topLabels[*maxPos] = lbls[i]
-			// Find new max
-			*maxDist = topDists[0]
-			*maxPos = 0
-			for j := 1; j < nNeigh; j++ {
-				if topDists[j] > *maxDist {
-					*maxDist = topDists[j]
-					*maxPos = j
-				}
-			}
-		}
-		base += dims
-	}
-}
-
-// getFraudCount finds the 5 nearest reference vectors and returns the fraud count.
-// If the result is uncertain (1–4 frauds), it probes additional clusters.
-func (idx *IVFIndex) getFraudCount(q [dims]int16) int {
-	// Always fetch nProbeRepair nearest centroids; use first nProbe normally.
-	allProbes := idx.findTopCentroids(q)
-
-	var topDists [nNeigh]int64
-	var topLabels [nNeigh]uint8
-	for i := range topDists {
-		topDists[i] = math.MaxInt64
-	}
-	maxDist := int64(math.MaxInt64)
-	maxPos := 0
-
-	// Initial scan: first nProbe clusters
-	for _, c := range allProbes[:nProbe] {
-		idx.scanCluster(c, q, &topDists, &topLabels, &maxDist, &maxPos)
-	}
-
-	cnt := 0
-	for _, l := range topLabels {
-		cnt += int(l)
-	}
-
-	// Repair: if result is uncertain, scan the remaining clusters
-	if cnt > 0 && cnt < nNeigh {
-		for _, c := range allProbes[nProbe:] {
-			idx.scanCluster(c, q, &topDists, &topLabels, &maxDist, &maxPos)
-		}
-		cnt = 0
-		for _, l := range topLabels {
-			cnt += int(l)
-		}
-	}
-
-	return cnt
+// getFraudCount delegates to scoreRequest: 1 CGo call does the full IVF search.
+func (idx *IVFIndex) getFraudCount(q [stride]int16) int {
+	return idx.scoreRequest(&q)
 }
 
 // ── K-means builder ─────────────────────────────────────────────────────────
@@ -498,8 +386,8 @@ func buildIVF(allVecs []int16, allLabels []uint8, k, sample, iters int) *IVFInde
 		off += clusterCounts[c]
 	}
 
-	// Write vectors in cluster order
-	flatVecs := make([]int16, n*dims)
+	// Write vectors in cluster order with stride=16 padding (last 2 int16 stay 0).
+	flatVecs := make([]int16, n*stride) // Go zero-init: elements dims..stride-1 are 0
 	flatLabels := make([]uint8, n)
 	cursor := make([]uint32, k)
 	copy(cursor, clusterOffsets)
@@ -507,12 +395,12 @@ func buildIVF(allVecs []int16, allLabels []uint8, k, sample, iters int) *IVFInde
 		c := fullAssign[i]
 		pos := cursor[c]
 		cursor[c]++
-		copy(flatVecs[pos*dims:(pos+1)*dims], allVecs[i*dims:i*dims+dims])
+		copy(flatVecs[int(pos)*stride:int(pos)*stride+dims], allVecs[i*dims:i*dims+dims])
 		flatLabels[pos] = allLabels[i]
 	}
 
-	// Quantize centroids to int16
-	centI16 := make([]int16, k*dims)
+	// Quantize centroids to int16 with stride=16 padding.
+	centI16 := make([]int16, k*stride) // last 2 per centroid stay 0
 	for c := 0; c < k; c++ {
 		for d := 0; d < dims; d++ {
 			v := centroids[c][d]
@@ -522,7 +410,7 @@ func buildIVF(allVecs []int16, allLabels []uint8, k, sample, iters int) *IVFInde
 			if v > 10000 {
 				v = 10000
 			}
-			centI16[c*dims+d] = int16(math.Round(v))
+			centI16[c*stride+d] = int16(math.Round(v))
 		}
 	}
 
@@ -621,7 +509,7 @@ func readIndex(path string) (*IVFIndex, error) {
 		return s, err
 	}
 
-	centroids, err := readI16(k * dims)
+	centroids, err := readI16(k * stride)
 	if err != nil {
 		return nil, fmt.Errorf("read centroids: %w", err)
 	}
@@ -633,7 +521,7 @@ func readIndex(path string) (*IVFIndex, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read offsets: %w", err)
 	}
-	vecs, err := readI16(n * dims)
+	vecs, err := readI16(n * stride)
 	if err != nil {
 		return nil, fmt.Errorf("read vecs: %w", err)
 	}
@@ -895,7 +783,7 @@ func handleFraudScore(ctx *fasthttp.RequestCtx) {
 	vec[13] = clamp32(merchantAvg * cfg.InvMaxMerchantAvgAmount)
 
 	// ── Quantize to int16 ─────────────────────────────────────────────────────
-	var q [dims]int16
+	var q [stride]int16 // last 2 elements stay 0 (SIMD padding)
 	for i, fv := range vec {
 		q[i] = quantizeF32(fv)
 	}
