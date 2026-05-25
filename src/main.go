@@ -36,7 +36,7 @@ const (
 	stride       = 16   // storage stride per vector: padded to 16 int16 for 128-bit SIMD alignment
 	ivfK         = 2048 // number of IVF clusters
 	nProbe       = 8    // clusters probed per query (fast path)
-	nProbeRepair = 64   // total clusters probed when result is uncertain
+	nProbeRepair = 48   // total clusters probed when result is uncertain
 	nNeigh       = 5    // k-NN neighbors
 	trainSample  = 50000
 	trainIters   = 50
@@ -218,7 +218,195 @@ func parseTS(s []byte) (int, int, int64) {
 
 // ── IVF search ───────────────────────────────────────────────────────────────
 
-// getFraudCount delegates to scoreRequest: 1 CGo call does the full IVF search.
+// centHeap is a fixed-capacity max-heap over centroid distances used to track
+// the n nearest centroids while scanning all ivfK centroids once.
+// Capacity is always ≤ nProbeRepair so the backing arrays live on the stack.
+type centHeap struct {
+	d    [nProbeRepair]int32
+	idx  [nProbeRepair]int32
+	size int
+	n    int // capacity: nProbe or nProbeRepair
+}
+
+func (h *centHeap) maxD() int32 {
+	if h.size < h.n {
+		return math.MaxInt32
+	}
+	return h.d[0]
+}
+
+func (h *centHeap) siftUp(i int) {
+	for i > 0 {
+		p := (i - 1) >> 1
+		if h.d[i] > h.d[p] {
+			h.d[i], h.d[p] = h.d[p], h.d[i]
+			h.idx[i], h.idx[p] = h.idx[p], h.idx[i]
+			i = p
+		} else {
+			break
+		}
+	}
+}
+
+func (h *centHeap) siftDown(i int) {
+	n := h.size
+	for {
+		l, r, lg := 2*i+1, 2*i+2, i
+		if l < n && h.d[l] > h.d[lg] {
+			lg = l
+		}
+		if r < n && h.d[r] > h.d[lg] {
+			lg = r
+		}
+		if lg == i {
+			break
+		}
+		h.d[i], h.d[lg] = h.d[lg], h.d[i]
+		h.idx[i], h.idx[lg] = h.idx[lg], h.idx[i]
+		i = lg
+	}
+}
+
+func (h *centHeap) insert(d int32, ci int32) {
+	if h.size < h.n {
+		h.d[h.size] = d
+		h.idx[h.size] = ci
+		h.size++
+		h.siftUp(h.size - 1)
+	} else if d < h.d[0] {
+		h.d[0] = d
+		h.idx[0] = ci
+		h.siftDown(0)
+	}
+}
+
+// neighHeap is a fixed-capacity max-heap for the nNeigh=5 nearest neighbors.
+// The maximum distance element is always at index 0 (root of max-heap).
+type neighHeap struct {
+	d    [nNeigh]int32
+	lbl  [nNeigh]uint8
+	size int
+}
+
+func (h *neighHeap) maxD() int32 {
+	if h.size < nNeigh {
+		return math.MaxInt32
+	}
+	return h.d[0]
+}
+
+func (h *neighHeap) siftUp(i int) {
+	for i > 0 {
+		p := (i - 1) >> 1
+		if h.d[i] > h.d[p] {
+			h.d[i], h.d[p] = h.d[p], h.d[i]
+			h.lbl[i], h.lbl[p] = h.lbl[p], h.lbl[i]
+			i = p
+		} else {
+			break
+		}
+	}
+}
+
+func (h *neighHeap) siftDown(i int) {
+	for {
+		l, r, lg := 2*i+1, 2*i+2, i
+		if l < nNeigh && h.d[l] > h.d[lg] {
+			lg = l
+		}
+		if r < nNeigh && h.d[r] > h.d[lg] {
+			lg = r
+		}
+		if lg == i {
+			break
+		}
+		h.d[i], h.d[lg] = h.d[lg], h.d[i]
+		h.lbl[i], h.lbl[lg] = h.lbl[lg], h.lbl[i]
+		i = lg
+	}
+}
+
+func (h *neighHeap) insert(d int32, lbl uint8) {
+	if h.size < nNeigh {
+		h.d[h.size] = d
+		h.lbl[h.size] = lbl
+		h.size++
+		h.siftUp(h.size - 1)
+	} else {
+		h.d[0] = d
+		h.lbl[0] = lbl
+		h.siftDown(0)
+	}
+}
+
+func (h *neighHeap) fraudCount() int {
+	n := 0
+	for i := 0; i < h.size; i++ {
+		n += int(h.lbl[i])
+	}
+	return n
+}
+
+// scoreRequest performs the full IVF nearest-neighbour search in pure Go.
+// sqDist16 is called via Go assembly (SSE4.1) on amd64, scalar fallback elsewhere.
+// No CGo: runs on the single GOMAXPROCS=1 OS thread, no CFS throttle contention.
+func (idx *IVFIndex) scoreRequest(q *[stride]int16) int {
+	// ── Phase 1: find nProbe nearest centroids ────────────────────────────────
+	var ch centHeap
+	ch.n = nProbe
+	for ci := 0; ci < ivfK; ci++ {
+		c := (*[stride]int16)(unsafe.Pointer(&idx.centroids[ci*stride]))
+		ch.insert(sqDist16(q, c), int32(ci))
+	}
+
+	// ── Phase 2: scan selected clusters, track nNeigh nearest neighbors ───────
+	var nh neighHeap
+	for pi := 0; pi < ch.size; pi++ {
+		ci := int(ch.idx[pi])
+		start := int(idx.offsets[ci])
+		count := int(idx.counts[ci])
+		maxD := nh.maxD()
+		for vi := start; vi < start+count; vi++ {
+			v := (*[stride]int16)(unsafe.Pointer(&idx.vecs[vi*stride]))
+			if d := sqDist16(q, v); d < maxD {
+				nh.insert(d, idx.labels[vi])
+				maxD = nh.maxD()
+			}
+		}
+	}
+
+	fc := nh.fraudCount()
+
+	// ── Phase 3: repair when result is borderline (2 or 3 fraud among 5) ──────
+	// Re-scan all centroids with a wider probe to reduce false positives/negatives.
+	if fc == 2 || fc == 3 {
+		var ch2 centHeap
+		ch2.n = nProbeRepair
+		for ci := 0; ci < ivfK; ci++ {
+			c := (*[stride]int16)(unsafe.Pointer(&idx.centroids[ci*stride]))
+			ch2.insert(sqDist16(q, c), int32(ci))
+		}
+		nh = neighHeap{} // reset
+		for pi := 0; pi < ch2.size; pi++ {
+			ci := int(ch2.idx[pi])
+			start := int(idx.offsets[ci])
+			count := int(idx.counts[ci])
+			maxD := nh.maxD()
+			for vi := start; vi < start+count; vi++ {
+				v := (*[stride]int16)(unsafe.Pointer(&idx.vecs[vi*stride]))
+				if d := sqDist16(q, v); d < maxD {
+					nh.insert(d, idx.labels[vi])
+					maxD = nh.maxD()
+				}
+			}
+		}
+		fc = nh.fraudCount()
+	}
+
+	return fc
+}
+
+// getFraudCount is the HTTP handler entry point into the IVF search.
 func (idx *IVFIndex) getFraudCount(q [stride]int16) int {
 	return idx.scoreRequest(&q)
 }

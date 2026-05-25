@@ -1,13 +1,12 @@
 # ─── Stage 1: Compile the Go binary ─────────────────────────────────────────
 FROM golang:1.22-alpine AS builder
 
-RUN apk add --no-cache gcc musl-dev
 WORKDIR /app
 COPY src/go.mod src/go.sum ./
 RUN go mod download
 
 COPY src/ ./
-RUN CGO_ENABLED=1 \
+RUN CGO_ENABLED=0 \
     go build -ldflags="-s -w" -o rinha .
 
 # ─── Stage 2: Build the IVF index from references.json.gz ────────────────────
