@@ -1,0 +1,55 @@
+x-api: &api-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  deploy:
+    resources:
+      limits:
+        cpus: '0.45'
+        memory: 155M
+  ulimits:
+    nofile:
+      soft: 65535
+      hard: 65535
+  restart: unless-stopped
+
+services:
+
+  api1:
+    <<: *api-common
+    container_name: rinha_api1
+    cpuset: "0"
+    environment:
+      - SERVER_PORT=8080
+    expose:
+      - "8080"
+
+  api2:
+    <<: *api-common
+    container_name: rinha_api2
+    cpuset: "1"
+    environment:
+      - SERVER_PORT=8080
+    expose:
+      - "8080"
+
+  lb:
+    image: nginx:1.27-alpine
+    container_name: rinha_lb
+    depends_on:
+      - api1
+      - api2
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "9999:9999"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.10'
+          memory: 40M
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    restart: unless-stopped
