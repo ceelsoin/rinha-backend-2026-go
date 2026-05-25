@@ -36,7 +36,7 @@ const (
 	stride       = 16   // storage stride per vector: padded to 16 int16 for 128-bit SIMD alignment
 	ivfK         = 2048 // number of IVF clusters
 	nProbe       = 8    // clusters probed per query (fast path)
-	nProbeRepair = 16   // total clusters probed when result is uncertain
+	nProbeRepair = 64   // total clusters probed when result is uncertain
 	nNeigh       = 5    // k-NN neighbors
 	trainSample  = 50000
 	trainIters   = 50
