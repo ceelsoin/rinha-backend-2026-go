@@ -1,0 +1,4 @@
+src/go
+.DS_Store
+*.log
+tests/test/results.json
