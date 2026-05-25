@@ -2,7 +2,7 @@ name: build
 
 on:
   push:
-    branches: [ main ]
+    branches: [ master ]
   workflow_dispatch:
 
 jobs:
@@ -28,7 +28,7 @@ jobs:
           images: ${{ secrets.DOCKERHUB_USERNAME }}/rinha-backend-2026
           tags: |
             type=ref,event=branch
-            type=raw,value=latest,enable=${{ github.ref_name == 'main' }}
+            type=raw,value=latest,enable=${{ github.ref_name == 'master' }}
 
       - name: Build and push
         uses: docker/build-push-action@v5

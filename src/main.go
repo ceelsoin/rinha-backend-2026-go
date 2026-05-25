@@ -21,6 +21,7 @@ import (
 	"math/rand"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"unsafe"
 
@@ -34,7 +35,7 @@ const (
 	dims         = 14   // vector dimensions
 	ivfK         = 2048 // number of IVF clusters
 	nProbe       = 4    // clusters probed per query (fast path)
-	nProbeRepair = 8    // total clusters probed when result is uncertain
+	nProbeRepair = 64   // total clusters probed when result is uncertain (8x wider repair catches boundary cases)
 	nNeigh       = 5    // k-NN neighbors
 	trainSample  = 50000
 	trainIters   = 50
@@ -964,6 +965,23 @@ func cmdBuild(args []string) {
 
 // ── Serve mode ───────────────────────────────────────────────────────────────
 
+// preWarmIndex reads every OS page of the vectors and labels slices so the
+// kernel faults them into RAM before the server starts accepting connections.
+// Without this, cold-start requests take extra latency for page faults.
+func preWarmIndex(idx *IVFIndex) {
+	const pageStride = 2048 // touch one int16 per 4KB page (2048 int16 = 4096 bytes)
+	var acc int32
+	for i := 0; i < len(idx.vecs); i += pageStride {
+		acc += int32(idx.vecs[i])
+	}
+	const labelStride = 4096 // one byte per 4KB page
+	for i := 0; i < len(idx.labels); i += labelStride {
+		acc += int32(idx.labels[i])
+	}
+	_ = acc // prevent compiler from optimising the reads away
+	log.Printf("[serve] pre-warmed %d MB of index vectors", len(idx.vecs)*2>>20)
+}
+
 func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	port := fs.Int("port", 8080, "HTTP listen port")
@@ -992,16 +1010,24 @@ func cmdServe(args []string) {
 		log.Fatalf("mcc risk: %v", err)
 	}
 
+	// Lock to 1 OS thread immediately — each container has exactly 1 CPU (cpuset).
+	runtime.GOMAXPROCS(1)
+
+	// Disable GC: hot path has near-zero allocations (pooled parsers, stack arrays).
+	// Eliminates GC-induced latency spikes that inflate p99.
+	debug.SetGCPercent(-1)
+
 	// Load index
 	globalIdx, err = readIndex(idxPath)
 	if err != nil {
 		log.Fatalf("read index: %v", err)
 	}
 
+	// Fault all 84MB of quantized vectors into RAM before accepting connections.
+	// Prevents OS page-fault latency spikes on first requests.
+	preWarmIndex(globalIdx)
+
 	log.Printf("[serve] listening on :%d", *port)
-	// Pin to 1 OS thread per container (each container has exactly 1 CPU via cpuset).
-	// Prevents the Go scheduler from spinning up idle M threads that waste CPU cycles.
-	runtime.GOMAXPROCS(1)
 
 	srv := &fasthttp.Server{
 		Handler:                       requestHandler,
