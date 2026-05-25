@@ -16,8 +16,6 @@ services:
         limits:
           cpus: "2.0"
           memory: 8G
-    storage_opt:
-      size: "1T"
 
   k6-smoke:
     image: grafana/k6:latest
@@ -36,5 +34,3 @@ services:
         limits:
           cpus: "2.0"
           memory: 8G
-    storage_opt:
-      size: "1T"
