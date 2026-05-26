@@ -19,10 +19,12 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"net"
 	"os"
 	"runtime"
 	"runtime/debug"
 	"sync"
+	"syscall"
 	"unsafe"
 
 	"github.com/valyala/fasthttp"
@@ -32,41 +34,71 @@ import (
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const (
-	dims         = 14   // feature dimensions (14 input features)
-	stride       = 16   // storage stride per vector: padded to 16 int16 for 128-bit SIMD alignment
-	ivfK         = 2048 // number of IVF clusters
-	nProbe       = 12   // clusters probed per query (fast path)
-	nProbeRepair = 48   // centHeap backing-array size; also caps sortedRepair
-	nNeigh       = 5    // k-NN neighbors
+	dims         = 14   // feature dimensions
+	stride       = 16   // storage stride per vector: padded to 16 int16 for SIMD alignment
+	l1K          = 256  // HIVF level-1 cluster count
+	l2KPerL1     = 256  // HIVF level-2 clusters per L1 cluster
+	l2KTotal     = l1K * l2KPerL1 // 65,536 total L2 clusters
+	nProbeL1     = 16   // top L1 clusters to probe per query
+	nProbeL2     = 256  // top L2 clusters to probe (initial pass)
+	nProbeL2Ext  = 512  // extended probe when score is uncertain
+	nNeigh       = 7    // k-NN neighbors (was 5)
+	fraudThresh  = float32(0.44) // score >= this → not approved
+	confLow      = float32(0.38) // adaptive probe lower bound
+	confHigh     = float32(0.50) // adaptive probe upper bound
+	nProbeRepair = 48   // centHeap backing-array size (L1 uses n=nProbeL1≤48)
 	trainSample  = 50000
-	trainIters   = 50
+	trainItersL1 = 30
+	trainItersL2 = 20
 )
 
-var ivfMagic = [8]byte{'G', 'O', 'I', 'V', 'F', '0', '2', '7'} // v2: stride=16 (SIMD-padded)
+var hivfMagic = [8]byte{'G', 'O', 'H', 'I', 'V', 'F', '0', '2'} // HIVF v2: +feature weights
 
-// Pre-built HTTP responses for all possible fraud counts (0..5).
-// Index = number of fraud neighbors found.
-var responses = [nNeigh + 1][]byte{
-	[]byte(`{"approved": true, "fraud_score": 0.00}`),
-	[]byte(`{"approved": true, "fraud_score": 0.20}`),
-	[]byte(`{"approved": true, "fraud_score": 0.40}`),
-	[]byte(`{"approved": false, "fraud_score": 0.60}`),
-	[]byte(`{"approved": false, "fraud_score": 0.80}`),
-	[]byte(`{"approved": false, "fraud_score": 1.00}`),
+// featureWeights are per-dimension importance multipliers applied to both reference
+// vectors at build time and query vectors at serve time. Sourced from top1-new Rust impl.
+// Pre-multiplying reference vectors at build time avoids per-distance-call multiplications.
+var featureWeights = [dims]float32{
+	1.0038165, 0.665417, 0.8668326, 0.5379362,
+	0.5, 0.3, 0.3701757, 1.0,
+	1.2, 1.2648705, 0.81239825, 1.051987,
+	0.8247206, 2.0315619,
+}
+
+// kernelCoeff scales L2 Euclidean distance for the Gaussian kernel exp(-L2 * kernelCoeff).
+// Calibrated to match the Rust implementation's Manhattan kernel exp(-manhattan * 0.5)
+// via manhattan ≈ sqrt(dims) * L2_euclidean → coeff = 0.5 * sqrt(14) ≈ 1.87.
+const kernelCoeff = float32(1.87)
+
+// Pre-built HTTP responses: approvedResponses[i] and deniedResponses[i] for
+// fraud_score = i/100 (i = 0..100). Selected by bucket = int(score*100 + 0.5).
+var approvedResponses [101][]byte
+var deniedResponses [101][]byte
+
+func init() {
+	for i := 0; i <= 100; i++ {
+		score := float64(i) / 100.0
+		approvedResponses[i] = []byte(fmt.Sprintf(`{"approved":true,"fraud_score":%.2f}`, score))
+		deniedResponses[i] = []byte(fmt.Sprintf(`{"approved":false,"fraud_score":%.2f}`, score))
+	}
 }
 
 // ── IVF Index ────────────────────────────────────────────────────────────────
 
-// IVFIndex holds the approximate nearest-neighbour index.
+// HIVFIndex holds the 2-level hierarchical IVF index.
 // All int16 values are quantized: float × 10000.
-type IVFIndex struct {
-	n         int      // total reference vectors
-	k         int      // number of clusters
-	centroids []int16  // k×dims, row-major
-	counts    []uint32 // per-cluster count
-	offsets   []uint32 // per-cluster start position in vecs/labels
-	vecs      []int16  // n×dims, organized by cluster
-	labels    []uint8  // n: 1=fraud, 0=legit
+type HIVFIndex struct {
+	n       int      // total reference vectors
+	l1Cent  []int16  // l1K × stride L1 super-centroids
+	l2Cent  []int16  // l2KTotal × stride L2 sub-centroids
+	offsets []uint32 // l2KTotal+1: offsets[i] = start in vecs for L2 cluster i
+	vecs    []int16  // n × stride, sorted by L2 cluster assignment
+	labels  []uint8  // n: 1=fraud, 0=legit
+}
+
+// distIdx pairs a distance with a cluster index for partial-sort helpers.
+type distIdx struct {
+	d int32
+	i int32
 }
 
 // ── Normalization config ──────────────────────────────────────────────────────
@@ -94,32 +126,33 @@ func clamp32(v float32) float32 {
 	return v
 }
 
-// quantizeF64 converts a normalized float64 to int16 (×10000), clamped to [-1,1].
+// quantizeF64 converts a float64 to int16 (×10000), clamped to int16 range.
+// Accepts values outside [-1,1] to accommodate feature-weighted inputs (max weight ≈ 2.03).
 func quantizeF64(v float64) int16 {
-	if v < -1.0 {
-		v = -1.0
-	}
-	if v > 1.0 {
-		v = 1.0
-	}
 	r := v * 10000.0
-	if r >= 0 {
-		r += 0.5
-	} else {
-		r -= 0.5
+	if r > 32767 {
+		return 32767
 	}
-	return int16(r)
+	if r < -32767 {
+		return -32767
+	}
+	if r >= 0 {
+		return int16(r + 0.5)
+	}
+	return int16(r - 0.5)
 }
 
-// quantizeF32 converts a float32 (already in [-1,1]) to int16 (×10000).
+// quantizeF32 converts a float32 to int16 (×10000), clamped to int16 range.
+// Accepts values outside [-1,1] to accommodate feature-weighted inputs (max weight ≈ 2.03).
 func quantizeF32(v float32) int16 {
-	if v < -1.0 {
-		v = -1.0
+	r := float64(v) * 10000.0
+	if r > 32767 {
+		return 32767
 	}
-	if v > 1.0 {
-		v = 1.0
+	if r < -32767 {
+		return -32767
 	}
-	return int16(math.Round(float64(v) * 10000.0))
+	return int16(math.Round(r))
 }
 
 // sqDist14 computes squared Euclidean distance between a fixed [14]int16 and a slice.
@@ -280,7 +313,7 @@ func (h *centHeap) insert(d int32, ci int32) {
 	}
 }
 
-// neighHeap is a fixed-capacity max-heap for the nNeigh=5 nearest neighbors.
+// neighHeap is a fixed-capacity max-heap for the nNeigh=7 nearest neighbors.
 // The maximum distance element is always at index 0 (root of max-heap).
 type neighHeap struct {
 	d    [nNeigh]int32
@@ -347,26 +380,123 @@ func (h *neighHeap) fraudCount() int {
 	return n
 }
 
-// scoreRequest performs the full IVF nearest-neighbour search in pure Go.
-// sqDist16 is called via Go assembly (SSE4.1) on amd64, scalar fallback elsewhere.
-// No CGo: runs on the single GOMAXPROCS=1 OS thread, no CFS throttle contention.
-func (idx *IVFIndex) scoreRequest(q *[stride]int16) int {
-	// ── Phase 1: find nProbe nearest centroids ────────────────────────────────
+// distWeightedScore computes a Gaussian kernel-weighted fraud score from the k neighbors.
+// weight_i = exp(-L2_euclidean_i * kernelCoeff), score = sum(w_i * label_i) / sum(w_i).
+// This gives closer neighbors more influence than distant ones, matching the Rust top1-new impl.
+func (h *neighHeap) distWeightedScore() float32 {
+	var fraudW, totalW float32
+	for i := 0; i < h.size; i++ {
+		// Convert int32 squared-L2 (int16 ×10000 units) to float L2 euclidean in [0, ~sqrt(14)].
+		distL2 := float32(math.Sqrt(float64(h.d[i]))) / 10000.0
+		w := float32(math.Exp(float64(-distL2 * kernelCoeff)))
+		totalW += w
+		fraudW += w * float32(h.lbl[i])
+	}
+	if totalW <= 0 {
+		return 0
+	}
+	return fraudW / totalW
+}
+
+// ── distIdx partial-sort helpers ─────────────────────────────────────────────
+
+// distIdxMaxHeapDown sifts element at position i down in a max-heap of []distIdx.
+func distIdxMaxHeapDown(s []distIdx, i, n int) {
+	for {
+		l, r, lg := 2*i+1, 2*i+2, i
+		if l < n && s[l].d > s[lg].d {
+			lg = l
+		}
+		if r < n && s[r].d > s[lg].d {
+			lg = r
+		}
+		if lg == i {
+			break
+		}
+		s[i], s[lg] = s[lg], s[i]
+		i = lg
+	}
+}
+
+// partialSortDistIdx rearranges s so that s[:k] contains the k nearest elements
+// (smallest .d) in sorted ascending order. Uses max-heap selection — O(N log k).
+func partialSortDistIdx(s []distIdx, k int) {
+	if k <= 0 {
+		return
+	}
+	if k >= len(s) {
+		k = len(s)
+	}
+	// Build max-heap over first k elements.
+	for i := k/2 - 1; i >= 0; i-- {
+		distIdxMaxHeapDown(s, i, k)
+	}
+	// For each remaining element: if closer, replace heap root and re-heapify.
+	for i := k; i < len(s); i++ {
+		if s[i].d < s[0].d {
+			s[0] = s[i]
+			distIdxMaxHeapDown(s, 0, k)
+		}
+	}
+	// Heap-sort the k elements into ascending order.
+	for i := k - 1; i > 0; i-- {
+		s[0], s[i] = s[i], s[0]
+		distIdxMaxHeapDown(s, 0, i)
+	}
+}
+
+// ── HIVF search ───────────────────────────────────────────────────────────────
+
+// scoreRequest performs the 3-phase HIVF nearest-neighbour search.
+// Phase 1: scan nProbeL1 nearest L1 super-centroids.
+// Phase 2: scan nProbeL2 nearest L2 sub-centroids from those L1 clusters.
+// Phase 3: exact scan of records in top nProbeL2 L2 clusters.
+// Adaptive: if score is uncertain, extend to nProbeL2Ext L2 clusters.
+// Returns a Gaussian kernel-weighted fraud score in [0, 1].
+func (idx *HIVFIndex) scoreRequest(q *[stride]int16) float32 {
+	// ── Phase 1: scan 256 L1 centroids → top nProbeL1 ─────────────────────
 	var ch centHeap
-	ch.n = nProbe
-	for ci := 0; ci < ivfK; ci++ {
-		c := (*[stride]int16)(unsafe.Pointer(&idx.centroids[ci*stride]))
+	ch.n = nProbeL1
+	for ci := 0; ci < l1K; ci++ {
+		c := (*[stride]int16)(unsafe.Pointer(&idx.l1Cent[ci*stride]))
 		ch.insert(sqDist16(q, c), int32(ci))
 	}
 
-	// ── Phase 2: scan selected clusters, track nNeigh nearest neighbors ───────
-	var nh neighHeap
+	// ── Phase 2: scan L2 centroids for top nProbeL1 L1 clusters ───────────
+	// l2All holds all nProbeL1×l2KPerL1 = 4096 (L2 distance, L2 global index) pairs.
+	// Allocated on heap to avoid large stack frames; pooled to avoid per-request GC pressure.
+	l2Buf := l2BufPool.Get().(*[nProbeL1 * l2KPerL1]distIdx)
+	defer l2BufPool.Put(l2Buf)
+
+	l2Count := 0
 	for pi := 0; pi < ch.size; pi++ {
-		ci := int(ch.idx[pi])
-		start := int(idx.offsets[ci])
-		count := int(idx.counts[ci])
+		l1i := int(ch.idx[pi])
+		base := l1i * l2KPerL1
+		for j := 0; j < l2KPerL1; j++ {
+			c := (*[stride]int16)(unsafe.Pointer(&idx.l2Cent[(base+j)*stride]))
+			l2Buf[l2Count] = distIdx{sqDist16(q, c), int32(base + j)}
+			l2Count++
+		}
+	}
+
+	// Partial sort: l2Buf[:nProbeL2Ext] = nProbeL2Ext nearest L2 clusters, ascending.
+	partialSortDistIdx(l2Buf[:l2Count], nProbeL2Ext)
+	if l2Count > nProbeL2Ext {
+		l2Count = nProbeL2Ext
+	}
+
+	// ── Phase 3: exact scan of records in top nProbeL2 clusters ───────────
+	var nh neighHeap
+	probeEnd := nProbeL2
+	if probeEnd > l2Count {
+		probeEnd = l2Count
+	}
+	for pi := 0; pi < probeEnd; pi++ {
+		l2i := int(l2Buf[pi].i)
+		start := int(idx.offsets[l2i])
+		end := int(idx.offsets[l2i+1])
 		maxD := nh.maxD()
-		for vi := start; vi < start+count; vi++ {
+		for vi := start; vi < end; vi++ {
 			v := (*[stride]int16)(unsafe.Pointer(&idx.vecs[vi*stride]))
 			if d := sqDist16(q, v); d < maxD {
 				nh.insert(d, idx.labels[vi])
@@ -375,28 +505,15 @@ func (idx *IVFIndex) scoreRequest(q *[stride]int16) int {
 		}
 	}
 
-	fc := nh.fraudCount()
-
-	// ── Phase 3: exact repair for any non-unanimous result (fc = 1..4) ────────
-	// Combined with the 12 clusters already scanned in Phase 2, this gives the
-	// exact 5-NN across all 2048 clusters — fixing false positives and negatives
-	// caused by the IVF approximation.
-	// No early stop: stopping at fc=5 would lock in fraud when a closer legit
-	// vector exists in a far-centroid cluster (the bug in the sorted approach).
-	if fc >= 1 && fc <= nNeigh-1 {
-		var skipSet [(ivfK + 63) / 64]uint64
-		for pi := 0; pi < ch.size; pi++ {
-			ci := ch.idx[pi]
-			skipSet[ci>>6] |= 1 << uint(ci&63)
-		}
-		for ci := 0; ci < ivfK; ci++ {
-			if skipSet[ci>>6]&(1<<uint(ci&63)) != 0 {
-				continue
-			}
-			start := int(idx.offsets[ci])
-			count := int(idx.counts[ci])
+	// ── Adaptive probing: extend scan when score is in uncertain zone ──────
+	initScore := float32(nh.fraudCount()) / float32(nNeigh)
+	if initScore > confLow && initScore < confHigh {
+		for pi := probeEnd; pi < l2Count; pi++ {
+			l2i := int(l2Buf[pi].i)
+			start := int(idx.offsets[l2i])
+			end := int(idx.offsets[l2i+1])
 			maxD := nh.maxD()
-			for vi := start; vi < start+count; vi++ {
+			for vi := start; vi < end; vi++ {
 				v := (*[stride]int16)(unsafe.Pointer(&idx.vecs[vi*stride]))
 				if d := sqDist16(q, v); d < maxD {
 					nh.insert(d, idx.labels[vi])
@@ -404,15 +521,14 @@ func (idx *IVFIndex) scoreRequest(q *[stride]int16) int {
 				}
 			}
 		}
-		fc = nh.fraudCount()
 	}
 
-	return fc
+	return nh.distWeightedScore()
 }
 
-// getFraudCount is the HTTP handler entry point into the IVF search.
-func (idx *IVFIndex) getFraudCount(q [stride]int16) int {
-	return idx.scoreRequest(&q)
+// l2BufPool reuses the 32 KB L2 distance buffer across requests.
+var l2BufPool = sync.Pool{
+	New: func() interface{} { return new([nProbeL1 * l2KPerL1]distIdx) },
 }
 
 // ── K-means builder ─────────────────────────────────────────────────────────
@@ -440,96 +556,89 @@ func nearestCentroidIdx(vec []int16, centroids [][]float64) int {
 	return best
 }
 
-// buildIVF runs k-means on a sample of the training data and builds the IVF index.
-func buildIVF(allVecs []int16, allLabels []uint8, k, sample, iters int) *IVFIndex {
-	n := len(allVecs) / dims
-	log.Printf("[build] n=%d k=%d sample=%d iters=%d", n, k, sample, iters)
-
-	rng := rand.New(rand.NewSource(0x52696E6861)) //nolint
-
-	// Sample indices (without replacement is nice but not required for k-means)
-	sampleIdx := make([]int, sample)
-	for i := range sampleIdx {
-		sampleIdx[i] = rng.Intn(n)
+// trainKMeans runs k-means++ initialization followed by k-means training.
+// vecs is a flat int16 array of n×dims; allN is the total number of vectors in vecs.
+// Returns a slice of k float64 centroids, each of length dims.
+func trainKMeans(vecs []int16, allN, k, sample, iters int, rng *rand.Rand) [][]float64 {
+	if allN == 0 || k == 0 {
+		return nil
+	}
+	if k > allN {
+		k = allN
+	}
+	if sample > allN {
+		sample = allN
 	}
 
-	// ── k-means++ initialization ──────────────────────────────────────────
-	log.Printf("[build] k-means++ init...")
+	sampleIdx := make([]int, sample)
+	for i := range sampleIdx {
+		sampleIdx[i] = rng.Intn(allN)
+	}
+
 	centroids := make([][]float64, k)
 	for i := range centroids {
 		centroids[i] = make([]float64, dims)
 	}
 	first := sampleIdx[rng.Intn(sample)]
 	for d := 0; d < dims; d++ {
-		centroids[0][d] = float64(allVecs[first*dims+d])
+		centroids[0][d] = float64(vecs[first*dims+d])
 	}
 
 	dmin := make([]float64, sample)
 	for i := range dmin {
 		dmin[i] = math.MaxFloat64
 	}
-
 	for c := 1; c < k; c++ {
 		prev := centroids[c-1]
 		total := 0.0
 		for i, si := range sampleIdx {
-			d := kmeansDistF64(prev, allVecs[si*dims:si*dims+dims])
+			d := kmeansDistF64(prev, vecs[si*dims:si*dims+dims])
 			if d < dmin[i] {
 				dmin[i] = d
 			}
 			total += dmin[i]
 		}
-		if total == 0 {
-			ri := sampleIdx[rng.Intn(sample)]
-			for d := 0; d < dims; d++ {
-				centroids[c][d] = float64(allVecs[ri*dims+d])
-			}
-			continue
-		}
-		target := rng.Float64() * total
-		acc := 0.0
-		chosen := sampleIdx[sample-1]
-		for i, si := range sampleIdx {
-			acc += dmin[i]
-			if acc >= target {
-				chosen = si
-				break
+		ri := sampleIdx[rng.Intn(sample)]
+		if total > 0 {
+			target := rng.Float64() * total
+			acc := 0.0
+			for i, si := range sampleIdx {
+				acc += dmin[i]
+				if acc >= target {
+					ri = si
+					break
+				}
 			}
 		}
 		for d := 0; d < dims; d++ {
-			centroids[c][d] = float64(allVecs[chosen*dims+d])
-		}
-		if c%256 == 0 {
-			log.Printf("[build]   init %d/%d", c, k)
+			centroids[c][d] = float64(vecs[ri*dims+d])
 		}
 	}
 
-	// ── K-means training on sample ────────────────────────────────────────
 	assignment := make([]int, sample)
 	for iter := 0; iter < iters; iter++ {
 		changed := 0
 		for i, si := range sampleIdx {
-			c := nearestCentroidIdx(allVecs[si*dims:si*dims+dims], centroids)
+			c := nearestCentroidIdx(vecs[si*dims:si*dims+dims], centroids)
 			if c != assignment[i] {
 				changed++
 				assignment[i] = c
 			}
 		}
-		// Recompute centroids
 		sums := make([]float64, k*dims)
 		counts := make([]int, k)
 		for i, si := range sampleIdx {
 			c := assignment[i]
 			counts[c]++
 			for d := 0; d < dims; d++ {
-				sums[c*dims+d] += float64(allVecs[si*dims+d])
+				sums[c*dims+d] += float64(vecs[si*dims+d])
 			}
 		}
 		for c := 0; c < k; c++ {
 			if counts[c] == 0 {
 				ri := sampleIdx[rng.Intn(sample)]
 				for d := 0; d < dims; d++ {
-					centroids[c][d] = float64(allVecs[ri*dims+d])
+					centroids[c][d] = float64(vecs[ri*dims+d])
 				}
 			} else {
 				inv := 1.0 / float64(counts[c])
@@ -538,15 +647,51 @@ func buildIVF(allVecs []int16, allLabels []uint8, k, sample, iters int) *IVFInde
 				}
 			}
 		}
-		log.Printf("[build]   iter %d/%d changed=%d", iter+1, iters, changed)
 		if changed == 0 {
 			break
 		}
 	}
+	return centroids
+}
 
-	// ── Assign all N vectors to nearest cluster (parallel) ────────────────
-	log.Printf("[build] assigning %d vectors...", n)
-	fullAssign := make([]int, n)
+// quantizeCentroids converts float64 centroids to int16 (×10000) with stride padding.
+// Nil entries in centroids (empty clusters) are left as all-zeros.
+func quantizeCentroids(centroids [][]float64, k int) []int16 {
+	out := make([]int16, k*stride)
+	for c := 0; c < k; c++ {
+		if c >= len(centroids) || centroids[c] == nil {
+			continue // zeros for missing/empty cluster centroids
+		}
+		for d := 0; d < dims; d++ {
+			v := centroids[c][d]
+			if v < -10000 {
+				v = -10000
+			}
+			if v > 10000 {
+				v = 10000
+			}
+			out[c*stride+d] = int16(math.Round(v))
+		}
+	}
+	return out
+}
+
+// buildHIVF trains a 2-level hierarchical IVF (HIVF) index.
+// Level 1: l1K=256 super-centroids trained on a global sample.
+// Level 2: l2KPerL1=256 sub-centroids per L1 cluster, trained on cluster members.
+func buildHIVF(allVecs []int16, allLabels []uint8) *HIVFIndex {
+	n := len(allVecs) / dims
+	log.Printf("[build] HIVF n=%d l1K=%d l2KPerL1=%d", n, l1K, l2KPerL1)
+
+	rng := rand.New(rand.NewSource(0x52696E6861)) //nolint
+
+	// ── Level 1: train l1K super-centroids on a global sample ─────────────
+	log.Printf("[build] L1 k-means++ k=%d sample=%d iters=%d", l1K, trainSample, trainItersL1)
+	l1Centroids := trainKMeans(allVecs, n, l1K, trainSample, trainItersL1, rng)
+
+	// ── Assign all N vectors to their nearest L1 cluster (parallel) ────────
+	log.Printf("[build] L1 assigning %d vectors...", n)
+	l1Assign := make([]int, n)
 	nw := runtime.NumCPU()
 	chunk := (n + nw - 1) / nw
 	var wg sync.WaitGroup
@@ -559,62 +704,133 @@ func buildIVF(allVecs []int16, allLabels []uint8, k, sample, iters int) *IVFInde
 		go func(s, e int) {
 			defer wg.Done()
 			for i := s; i < e; i++ {
-				fullAssign[i] = nearestCentroidIdx(allVecs[i*dims:i*dims+dims], centroids)
+				l1Assign[i] = nearestCentroidIdx(allVecs[i*dims:i*dims+dims], l1Centroids)
 			}
 		}(s, e)
 	}
 	wg.Wait()
 
-	// ── Build cluster layout ──────────────────────────────────────────────
-	log.Printf("[build] building cluster layout...")
-	clusterCounts := make([]uint32, k)
-	for _, c := range fullAssign {
-		clusterCounts[c]++
+	// Group vector indices by L1 cluster.
+	l1Groups := make([][]int, l1K)
+	for i := 0; i < l1K; i++ {
+		l1Groups[i] = make([]int, 0, n/l1K+64)
 	}
-	clusterOffsets := make([]uint32, k)
+	for i, c := range l1Assign {
+		l1Groups[c] = append(l1Groups[c], i)
+	}
+
+	// ── Level 2: train l2KPerL1 sub-centroids for each L1 cluster (parallel) ─
+	log.Printf("[build] L2 training %d sub-clusters per L1 (parallel)...", l2KPerL1)
+	l2CentroidsAll := make([][]float64, l2KTotal)
+	l2AssignPerGroup := make([][]int, l1K) // L2 local assignment per group member
+
+	var mu sync.Mutex
+	type workItem struct{ l1i int }
+	work := make(chan workItem, l1K)
+	for i := 0; i < l1K; i++ {
+		work <- workItem{i}
+	}
+	close(work)
+
+	var wg2 sync.WaitGroup
+	for w := 0; w < nw; w++ {
+		wg2.Add(1)
+		go func() {
+			defer wg2.Done()
+			localRng := rand.New(rand.NewSource(rng.Int63()))
+			for item := range work {
+				l1i := item.l1i
+				members := l1Groups[l1i]
+				cnt := len(members)
+				if cnt == 0 {
+					continue
+				}
+				k2 := l2KPerL1
+				if k2 > cnt {
+					k2 = cnt
+				}
+				// Build a flat int16 array for just these members.
+				memberVecs := make([]int16, cnt*dims)
+				for mi, gi := range members {
+					copy(memberVecs[mi*dims:mi*dims+dims], allVecs[gi*dims:gi*dims+dims])
+				}
+				samp := 2000
+				if samp > cnt {
+					samp = cnt
+				}
+				c2 := trainKMeans(memberVecs, cnt, k2, samp, trainItersL2, localRng)
+				// Assign members to L2 sub-clusters.
+				assign2 := make([]int, cnt)
+				for mi := 0; mi < cnt; mi++ {
+					assign2[mi] = nearestCentroidIdx(memberVecs[mi*dims:mi*dims+dims], c2)
+				}
+				base := l1i * l2KPerL1
+				mu.Lock()
+				for ci, cen := range c2 {
+					l2CentroidsAll[base+ci] = cen
+				}
+				l2AssignPerGroup[l1i] = assign2
+				mu.Unlock()
+			}
+		}()
+	}
+	wg2.Wait()
+
+	// ── Build final layout: sort vectors by (L1, L2) assignment ───────────
+	log.Printf("[build] building final cluster layout...")
+	// Compute per-L2-cluster counts.
+	l2Counts := make([]uint32, l2KTotal)
+	for l1i, members := range l1Groups {
+		assign2 := l2AssignPerGroup[l1i]
+		base := l1i * l2KPerL1
+		for mi := range members {
+			if mi < len(assign2) {
+				l2Counts[base+assign2[mi]]++
+			}
+		}
+	}
+	// Compute offsets (prefix sum) + sentinel.
+	l2Offsets := make([]uint32, l2KTotal+1)
 	var off uint32
-	for c := 0; c < k; c++ {
-		clusterOffsets[c] = off
-		off += clusterCounts[c]
+	for ci := 0; ci < l2KTotal; ci++ {
+		l2Offsets[ci] = off
+		off += l2Counts[ci]
 	}
+	l2Offsets[l2KTotal] = off
 
-	// Write vectors in cluster order with stride=16 padding (last 2 int16 stay 0).
-	flatVecs := make([]int16, n*stride) // Go zero-init: elements dims..stride-1 are 0
+	// Write vectors in L2-cluster order.
+	flatVecs := make([]int16, n*stride)
 	flatLabels := make([]uint8, n)
-	cursor := make([]uint32, k)
-	copy(cursor, clusterOffsets)
-	for i := 0; i < n; i++ {
-		c := fullAssign[i]
-		pos := cursor[c]
-		cursor[c]++
-		copy(flatVecs[int(pos)*stride:int(pos)*stride+dims], allVecs[i*dims:i*dims+dims])
-		flatLabels[pos] = allLabels[i]
-	}
-
-	// Quantize centroids to int16 with stride=16 padding.
-	centI16 := make([]int16, k*stride) // last 2 per centroid stay 0
-	for c := 0; c < k; c++ {
-		for d := 0; d < dims; d++ {
-			v := centroids[c][d]
-			if v < -10000 {
-				v = -10000
+	cursor := make([]uint32, l2KTotal)
+	copy(cursor, l2Offsets[:l2KTotal])
+	for l1i, members := range l1Groups {
+		assign2 := l2AssignPerGroup[l1i]
+		base := l1i * l2KPerL1
+		for mi, gi := range members {
+			var l2loc int
+			if mi < len(assign2) {
+				l2loc = base + assign2[mi]
+			} else {
+				l2loc = base
 			}
-			if v > 10000 {
-				v = 10000
-			}
-			centI16[c*stride+d] = int16(math.Round(v))
+			pos := cursor[l2loc]
+			cursor[l2loc]++
+			copy(flatVecs[int(pos)*stride:int(pos)*stride+dims], allVecs[gi*dims:gi*dims+dims])
+			flatLabels[pos] = allLabels[gi]
 		}
 	}
 
-	log.Printf("[build] IVF built: %d vectors, %d clusters", n, k)
-	return &IVFIndex{
-		n:         n,
-		k:         k,
-		centroids: centI16,
-		counts:    clusterCounts,
-		offsets:   clusterOffsets,
-		vecs:      flatVecs,
-		labels:    flatLabels,
+	l1CentI16 := quantizeCentroids(l1Centroids, l1K)
+	l2CentI16 := quantizeCentroids(l2CentroidsAll, l2KTotal)
+
+	log.Printf("[build] HIVF built: n=%d L1=%d L2=%d", n, l1K, l2KTotal)
+	return &HIVFIndex{
+		n:       n,
+		l1Cent:  l1CentI16,
+		l2Cent:  l2CentI16,
+		offsets: l2Offsets,
+		vecs:    flatVecs,
+		labels:  flatLabels,
 	}
 }
 
@@ -636,7 +852,7 @@ func uint32ToBytes(s []uint32) []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(&s[0])), len(s)*4)
 }
 
-func writeIndex(path string, idx *IVFIndex) error {
+func writeIndex(path string, idx *HIVFIndex) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -644,17 +860,18 @@ func writeIndex(path string, idx *IVFIndex) error {
 	defer f.Close()
 	w := bufio.NewWriterSize(f, 1<<20)
 
-	// Header
-	w.Write(ivfMagic[:])
-	binary.Write(w, binary.LittleEndian, uint32(1))      // version
-	binary.Write(w, binary.LittleEndian, uint32(idx.n))
-	binary.Write(w, binary.LittleEndian, uint32(idx.k))
+	// Header: magic + version + n
+	w.Write(hivfMagic[:])
+	binary.Write(w, binary.LittleEndian, uint32(1))     // version
+	binary.Write(w, binary.LittleEndian, uint32(idx.n)) // total vectors
+	// l1K and l2KPerL1 are compile-time constants; no need to store.
 
-	// Centroids, counts, offsets
-	w.Write(int16ToBytes(idx.centroids))
-	w.Write(uint32ToBytes(idx.counts))
+	// L1 centroids (l1K × stride × int16)
+	w.Write(int16ToBytes(idx.l1Cent))
+	// L2 centroids (l2KTotal × stride × int16)
+	w.Write(int16ToBytes(idx.l2Cent))
+	// Offsets (l2KTotal+1 × uint32)
 	w.Write(uint32ToBytes(idx.offsets))
-
 	// Vectors and labels
 	w.Write(int16ToBytes(idx.vecs))
 	w.Write(idx.labels)
@@ -662,7 +879,7 @@ func writeIndex(path string, idx *IVFIndex) error {
 	return w.Flush()
 }
 
-func readIndex(path string) (*IVFIndex, error) {
+func readIndex(path string) (*HIVFIndex, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -670,25 +887,21 @@ func readIndex(path string) (*IVFIndex, error) {
 	defer f.Close()
 	r := bufio.NewReaderSize(f, 1<<20)
 
-	// Header
 	var magic [8]byte
 	if _, err := io.ReadFull(r, magic[:]); err != nil {
 		return nil, err
 	}
-	if magic != ivfMagic {
-		return nil, fmt.Errorf("bad magic")
+	if magic != hivfMagic {
+		return nil, fmt.Errorf("bad magic (got %q, want %q)", magic, hivfMagic)
 	}
-	var version, n32, k32 uint32
+	var version, n32 uint32
 	if err := binary.Read(r, binary.LittleEndian, &version); err != nil {
 		return nil, fmt.Errorf("read version: %w", err)
 	}
 	if err := binary.Read(r, binary.LittleEndian, &n32); err != nil {
 		return nil, fmt.Errorf("read n: %w", err)
 	}
-	if err := binary.Read(r, binary.LittleEndian, &k32); err != nil {
-		return nil, fmt.Errorf("read k: %w", err)
-	}
-	n, k := int(n32), int(k32)
+	n := int(n32)
 
 	readI16 := func(count int) ([]int16, error) {
 		s := make([]int16, count)
@@ -701,15 +914,15 @@ func readIndex(path string) (*IVFIndex, error) {
 		return s, err
 	}
 
-	centroids, err := readI16(k * stride)
+	l1Cent, err := readI16(l1K * stride)
 	if err != nil {
-		return nil, fmt.Errorf("read centroids: %w", err)
+		return nil, fmt.Errorf("read l1Cent: %w", err)
 	}
-	counts, err := readU32(k)
+	l2Cent, err := readI16(l2KTotal * stride)
 	if err != nil {
-		return nil, fmt.Errorf("read counts: %w", err)
+		return nil, fmt.Errorf("read l2Cent: %w", err)
 	}
-	offsets, err := readU32(k)
+	offsets, err := readU32(l2KTotal + 1)
 	if err != nil {
 		return nil, fmt.Errorf("read offsets: %w", err)
 	}
@@ -722,16 +935,17 @@ func readIndex(path string) (*IVFIndex, error) {
 		return nil, fmt.Errorf("read labels: %w", err)
 	}
 
-	log.Printf("[serve] loaded index: n=%d k=%d", n, k)
-	return &IVFIndex{
-		n: n, k: k,
-		centroids: centroids,
-		counts:    counts,
-		offsets:   offsets,
-		vecs:      vecs,
-		labels:    labels,
+	log.Printf("[serve] loaded HIVF index: n=%d L1=%d L2=%d", n, l1K, l2KTotal)
+	return &HIVFIndex{
+		n:       n,
+		l1Cent:  l1Cent,
+		l2Cent:  l2Cent,
+		offsets: offsets,
+		vecs:    vecs,
+		labels:  labels,
 	}, nil
 }
+
 
 // ── References loader ────────────────────────────────────────────────────────
 
@@ -783,8 +997,8 @@ func loadReferences(path string) ([]int16, []uint8, error) {
 		if err := dec.Decode(&entry); err != nil {
 			return nil, nil, fmt.Errorf("decode entry %d: %w", count, err)
 		}
-		for _, v := range entry.Vector {
-			vecs = append(vecs, quantizeF64(v))
+		for i, v := range entry.Vector {
+			vecs = append(vecs, quantizeF64(float64(featureWeights[i])*v))
 		}
 		if entry.Label == "fraud" {
 			labels = append(labels, 1)
@@ -852,7 +1066,7 @@ var parserPool fastjson.ParserPool
 
 // Server state (read-only after startup).
 var (
-	globalIdx     *IVFIndex
+	globalIdx     *HIVFIndex
 	globalMCCRisk map[string]float32
 	globalNorm    NormConfig
 )
@@ -974,18 +1188,27 @@ func handleFraudScore(ctx *fasthttp.RequestCtx) {
 	// 13. merchant avg_amount / max_merchant_avg_amount
 	vec[13] = clamp32(merchantAvg * cfg.InvMaxMerchantAvgAmount)
 
-	// ── Quantize to int16 ─────────────────────────────────────────────────────
+	// ── Quantize to int16 (with feature weights baked in) ────────────────────
 	var q [stride]int16 // last 2 elements stay 0 (SIMD padding)
 	for i, fv := range vec {
-		q[i] = quantizeF32(fv)
+		q[i] = quantizeF32(fv * featureWeights[i])
 	}
 
-	// ── KNN search ───────────────────────────────────────────────────────────
-	fraudCount := globalIdx.getFraudCount(q)
+	// ── HIVF search ──────────────────────────────────────────────────────────
+	score := globalIdx.scoreRequest(&q)
 
 	// ── Return pre-computed response ─────────────────────────────────────────
+	approved := score < fraudThresh
+	bucket := int(score*100 + 0.5)
+	if bucket > 100 {
+		bucket = 100
+	}
 	ctx.SetContentTypeBytes([]byte("application/json"))
-	ctx.SetBody(responses[fraudCount])
+	if approved {
+		ctx.SetBody(approvedResponses[bucket])
+	} else {
+		ctx.SetBody(deniedResponses[bucket])
+	}
 }
 
 func requestHandler(ctx *fasthttp.RequestCtx) {
@@ -1006,14 +1229,11 @@ func requestHandler(ctx *fasthttp.RequestCtx) {
 
 func cmdBuild(args []string) {
 	fs := flag.NewFlagSet("build", flag.ExitOnError)
-	kFlag := fs.Int("k", ivfK, "number of IVF clusters")
-	sFlag := fs.Int("sample", trainSample, "k-means sample size")
-	iFlag := fs.Int("iters", trainIters, "k-means iterations")
 	fs.Parse(args)
 
 	remaining := fs.Args()
 	if len(remaining) < 4 {
-		fmt.Fprintln(os.Stderr, "Usage: rinha build <references.json[.gz]> <output.bin> <norm.json> <mcc.json> [flags]")
+		fmt.Fprintln(os.Stderr, "Usage: rinha build <references.json[.gz]> <output.bin> <norm.json> <mcc.json>")
 		os.Exit(1)
 	}
 	refPath, outPath, normPath, mccPath := remaining[0], remaining[1], remaining[2], remaining[3]
@@ -1032,8 +1252,8 @@ func cmdBuild(args []string) {
 		log.Fatalf("load references: %v", err)
 	}
 
-	// Build index
-	idx := buildIVF(vecs, labels, *kFlag, *sFlag, *iFlag)
+	// Build HIVF index
+	idx := buildHIVF(vecs, labels)
 
 	// Write index
 	log.Printf("[build] writing %s...", outPath)
@@ -1048,18 +1268,88 @@ func cmdBuild(args []string) {
 // preWarmIndex reads every OS page of the vectors and labels slices so the
 // kernel faults them into RAM before the server starts accepting connections.
 // Without this, cold-start requests take extra latency for page faults.
-func preWarmIndex(idx *IVFIndex) {
+func preWarmIndex(idx *HIVFIndex) {
 	const pageStride = 2048 // touch one int16 per 4KB page (2048 int16 = 4096 bytes)
 	var acc int32
+	for i := 0; i < len(idx.l1Cent); i += pageStride {
+		acc += int32(idx.l1Cent[i])
+	}
+	for i := 0; i < len(idx.l2Cent); i += pageStride {
+		acc += int32(idx.l2Cent[i])
+	}
 	for i := 0; i < len(idx.vecs); i += pageStride {
 		acc += int32(idx.vecs[i])
 	}
-	const labelStride = 4096 // one byte per 4KB page
+	const labelStride = 4096
 	for i := 0; i < len(idx.labels); i += labelStride {
 		acc += int32(idx.labels[i])
 	}
-	_ = acc // prevent compiler from optimising the reads away
-	log.Printf("[serve] pre-warmed %d MB of index vectors", len(idx.vecs)*2>>20)
+	_ = acc
+	log.Printf("[serve] pre-warmed HIVF index: vecs=%d MB l2Cent=%d KB",
+		len(idx.vecs)*2>>20, len(idx.l2Cent)*2>>10)
+}
+
+// ── FD-passing receiver (Unix DGRAM + SCM_RIGHTS) ────────────────────────────
+
+// bindDGRAMSocket creates and binds a Unix DGRAM socket to path.
+// The LB sends client file descriptors here via sendmsg/SCM_RIGHTS.
+func bindDGRAMSocket(path string) (int, error) {
+	fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_DGRAM, 0)
+	if err != nil {
+		return 0, fmt.Errorf("socket: %w", err)
+	}
+	// Large receive buffer: absorbs fd bursts during peak load without blocking the LB.
+	syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 16*1024*1024) //nolint
+	addr := &syscall.SockaddrUnix{Name: path}
+	if err := syscall.Bind(fd, addr); err != nil {
+		syscall.Close(fd) //nolint
+		return 0, fmt.Errorf("bind: %w", err)
+	}
+	// Make socket world-writable so the LB (different process/container) can send to it.
+	os.Chmod(path, 0777) //nolint
+	return fd, nil
+}
+
+// recvFDLoop blocks on recvmsg, receiving client fds from the LB.
+// For each received fd, wraps it as a net.Conn and calls srv.ServeConn in a goroutine.
+func recvFDLoop(udsFd int, srv *fasthttp.Server) {
+	const oobSize = 256 // CMSG_SPACE(sizeof(int)) ≈ 24; 256 is ample
+	oob := make([]byte, oobSize)
+	dummy := make([]byte, 1)
+
+	for {
+		_, oobn, _, _, err := syscall.Recvmsg(udsFd, dummy, oob, 0)
+		if err != nil {
+			continue
+		}
+		if oobn == 0 {
+			continue
+		}
+
+		scms, err := syscall.ParseSocketControlMessage(oob[:oobn])
+		if err != nil || len(scms) == 0 {
+			continue
+		}
+		fds, err := syscall.ParseUnixRights(&scms[0])
+		if err != nil || len(fds) == 0 {
+			continue
+		}
+
+		// net.FileConn dups the fd internally (sets O_NONBLOCK on the dup).
+		// We then close the original; the conn owns the dup'd fd.
+		f := os.NewFile(uintptr(fds[0]), "tcp-conn")
+		conn, err := net.FileConn(f)
+		f.Close()
+		if err != nil {
+			syscall.Close(fds[0]) //nolint
+			continue
+		}
+
+		go func() {
+			defer conn.Close()
+			srv.ServeConn(conn)
+		}()
+	}
 }
 
 func cmdServe(args []string) {
@@ -1125,12 +1415,18 @@ func cmdServe(args []string) {
 	}
 
 	if socketPath != "" {
-		// Unix domain socket: eliminate TCP stack overhead (~10-20µs per request).
-		os.Remove(socketPath) // clean up any leftover socket from previous run
-		log.Printf("[serve] listening on unix:%s", socketPath)
-		if err := srv.ListenAndServeUNIX(socketPath, 0777); err != nil {
-			log.Fatalf("server unix: %v", err)
+		// FD-passing mode: receive client fds from the Go LB via Unix DGRAM + SCM_RIGHTS.
+		// The LB accepts TCP connections and passes each fd here via sendmsg/SCM_RIGHTS.
+		// This eliminates the proxy double-copy: the API handles the raw TCP fd directly.
+		log.Printf("[serve] FD-passing mode on unix-dgram:%s", socketPath)
+		os.Remove(socketPath) // clean up leftover from previous run
+
+		udsFd, err := bindDGRAMSocket(socketPath)
+		if err != nil {
+			log.Fatalf("bind DGRAM socket %s: %v", socketPath, err)
 		}
+		log.Printf("[serve] ready, receiving fds from LB")
+		recvFDLoop(udsFd, srv)
 	} else {
 		log.Printf("[serve] listening on :%d", *port)
 		if err := srv.ListenAndServe(fmt.Sprintf(":%d", *port)); err != nil {

@@ -1,4 +1,4 @@
-# ─── Stage 1: Compile the Go binary ─────────────────────────────────────────
+# ─── Stage 1: Compile Go binaries (API + LB) ───────────────────────────────────
 FROM golang:1.22-alpine AS builder
 
 WORKDIR /app
@@ -7,7 +7,8 @@ RUN go mod download
 
 COPY src/ ./
 RUN CGO_ENABLED=0 \
-    go build -ldflags="-s -w" -o rinha .
+    go build -ldflags="-s -w" -o rinha . && \
+    go build -ldflags="-s -w" -o lb ./cmd/lb
 
 # ─── Stage 2: Build the IVF index from references.json.gz ────────────────────
 FROM golang:1.22-alpine AS indexer
@@ -31,6 +32,7 @@ FROM alpine:3.20
 
 WORKDIR /app
 COPY --from=builder  /app/rinha               ./
+COPY --from=builder  /app/lb                  ./
 COPY --from=indexer  /app/resources/references.bin    ./resources/
 COPY resources/normalization.json ./resources/
 COPY resources/mcc_risk.json      ./resources/
