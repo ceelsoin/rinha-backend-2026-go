@@ -1,11 +1,11 @@
 package main
 
-// Rinha de Backend 2026 — Fraud Detection via Vector Search
-// Single-file Go backend using fasthttp + IVF approximate KNN.
+// Rinha de Backend 2026 — Fraud Detection
+// Minimal raw-TCP HTTP/1.1 server + cursor-based JSON parser + decision tree.
 //
 // Usage:
 //   Build index: ./rinha build <references.json.gz> <output.bin> <norm.json> <mcc.json>
-//   Run server:  ./rinha serve <index.bin> <norm.json> <mcc.json> [port]
+//   Run server:  ./rinha serve <norm.json> <mcc.json> [--port N]
 
 import (
 	"bufio"
@@ -26,9 +26,6 @@ import (
 	"sync"
 	"syscall"
 	"unsafe"
-
-	"github.com/valyala/fasthttp"
-	"github.com/valyala/fastjson"
 )
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -44,6 +41,7 @@ const (
 	nProbeL2Ext  = 512  // extended probe when score is uncertain
 	nNeigh       = 5    // k-NN neighbors — spec: k=5, fraud_score = frauds/5, approved < 0.6
 	fraudThresh  = float32(0.60) // spec threshold: approve if fraud_score < 0.6
+	treeDims     = 21   // feature count for the decision tree (14 normalised + 7 raw extras)
 	confLow      = float32(0.38) // adaptive probe: extend when score ≥ confLow (catches 2/5=0.40)
 	confHigh     = float32(0.62) // adaptive probe: extend when score ≤ confHigh (catches 3/5=0.60)
 	nProbeRepair = 48   // centHeap backing-array size (L1 uses n=nProbeL1≤48)
@@ -67,17 +65,19 @@ var featureWeights = [dims]float32{
 // kernelCoeff removed — scoring now uses simple fraud count / k, matching the official spec.
 
 // Pre-built HTTP responses: approvedResponses[i] and deniedResponses[i] for
-// fraud_score = i/100 (i = 0..100). Selected by bucket = int(score*100 + 0.5).
-var approvedResponses [101][]byte
-var deniedResponses [101][]byte
-
-func init() {
-	for i := 0; i <= 100; i++ {
-		score := float64(i) / 100.0
-		approvedResponses[i] = []byte(fmt.Sprintf(`{"approved":true,"fraud_score":%.2f}`, score))
-		deniedResponses[i] = []byte(fmt.Sprintf(`{"approved":false,"fraud_score":%.2f}`, score))
-	}
-}
+// Pre-built HTTP/1.1 responses for the two possible outcomes.
+// Writing a single pre-assembled []byte is faster than building headers at runtime.
+var (
+	// {"approved":true,"fraud_score":0.0}\n  — 36 bytes
+	httpApproved = []byte("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 36\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}\n")
+	// {"approved":false,"fraud_score":1.0}\n — 37 bytes
+	httpDenied = []byte("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 37\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}\n")
+	// {"ready":true}\n — 15 bytes
+	httpReady = []byte("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 15\r\n\r\n{\"ready\":true}\n")
+	// error responses (connection closes after)
+	httpBadReq   = []byte("HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 24\r\n\r\n{\"error\":\"bad_request\"}\n")
+	httpNotFound = []byte("HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: 22\r\n\r\n{\"error\":\"not_found\"}\n")
+)
 
 // ── IVF Index ────────────────────────────────────────────────────────────────
 
@@ -1157,12 +1157,7 @@ func loadMCCRisk(path string) (map[string]float32, error) {
 	return m, nil
 }
 
-// ── HTTP handler ─────────────────────────────────────────────────────────────
-
-var parserPool fastjson.ParserPool
-
-// jsonCT is the Content-Type header value reused across all JSON responses.
-var jsonCT = []byte("application/json")
+// ── HTTP handler (minimal raw net.Conn + keep-alive) ────────────────────────
 
 // Server state (read-only after startup).
 var (
@@ -1196,8 +1191,510 @@ func isRiskyMCC(mcc []byte) bool {
 	return false
 }
 
+// ── Minimal HTTP/1.1 server ───────────────────────────────────────────────────
+
+const maxReqBuf = 16 * 1024
+
+// httpReq describes a parsed HTTP request located inside the read buffer.
+type httpReq struct {
+	headerEnd     int // index of last byte before \r\n\r\n
+	contentLength int
+	consumed      int // total bytes this request occupies in the buffer
+}
+
+// handleConn handles one TCP/FD connection with HTTP/1.1 keep-alive.
+// Multiple requests arrive on the same connection; we loop until EOF or error.
+func handleConn(conn net.Conn) {
+	defer conn.Close()
+	var buf [maxReqBuf]byte
+	n := 0
+	for {
+		req, ok := readNextRequest(conn, buf[:], &n)
+		if !ok {
+			return
+		}
+		head := buf[:req.headerEnd]
+		firstLineEnd := bytes.IndexByte(head, '\r')
+		if firstLineEnd < 0 {
+			firstLineEnd = len(head)
+		}
+		firstLine := head[:firstLineEnd]
+
+		switch {
+		case bytes.HasPrefix(firstLine, []byte("GET /ready ")):
+			conn.Write(httpReady) //nolint
+			discardConsumed(buf[:], &n, req.consumed)
+		case bytes.HasPrefix(firstLine, []byte("POST /fraud-score ")):
+			body := buf[req.headerEnd+4 : req.consumed]
+			conn.Write(scoreFraudBody(body)) //nolint
+			discardConsumed(buf[:], &n, req.consumed)
+		default:
+			conn.Write(httpNotFound) //nolint
+			return
+		}
+	}
+}
+
+func readNextRequest(conn net.Conn, buf []byte, n *int) (httpReq, bool) {
+	for {
+		if req, ok := tryParseRequest(buf[:*n]); ok {
+			return req, true
+		}
+		if *n == len(buf) {
+			return httpReq{}, false
+		}
+		nr, err := conn.Read(buf[*n:])
+		if nr > 0 {
+			*n += nr
+			continue
+		}
+		if err != nil {
+			return httpReq{}, false
+		}
+	}
+}
+
+func tryParseRequest(buf []byte) (httpReq, bool) {
+	headerEnd := bytes.Index(buf, []byte("\r\n\r\n"))
+	if headerEnd < 0 {
+		return httpReq{}, false
+	}
+	head := buf[:headerEnd]
+	firstLineEnd := bytes.IndexByte(head, '\r')
+	if firstLineEnd < 0 {
+		firstLineEnd = len(head)
+	}
+	bodyStart := headerEnd + 4
+	if !bytes.HasPrefix(head[:firstLineEnd], []byte("POST /fraud-score ")) {
+		return httpReq{headerEnd: headerEnd, consumed: bodyStart}, true
+	}
+	cl := parseContentLengthHeader(head)
+	consumed := bodyStart + cl
+	if consumed > len(buf) {
+		return httpReq{}, false
+	}
+	return httpReq{headerEnd: headerEnd, contentLength: cl, consumed: consumed}, true
+}
+
+func discardConsumed(buf []byte, n *int, consumed int) {
+	if consumed >= *n {
+		*n = 0
+		return
+	}
+	leftover := *n - consumed
+	copy(buf[:leftover], buf[consumed:*n])
+	*n = leftover
+}
+
+func parseContentLengthHeader(head []byte) int {
+	tryKey := func(key []byte) int {
+		pos := bytes.Index(head, key)
+		if pos < 0 {
+			return -1
+		}
+		i := pos + len(key)
+		for i < len(head) && (head[i] == ' ' || head[i] == '\t') {
+			i++
+		}
+		v, digits := 0, 0
+		for i < len(head) && head[i] >= '0' && head[i] <= '9' {
+			v = v*10 + int(head[i]-'0')
+			i++
+			digits++
+		}
+		if digits == 0 {
+			return -1
+		}
+		return v
+	}
+	if v := tryKey([]byte("content-length:")); v >= 0 {
+		return v
+	}
+	if v := tryKey([]byte("Content-Length:")); v >= 0 {
+		return v
+	}
+	return 0
+}
+
+// ── Cursor-based JSON parser ──────────────────────────────────────────────────
+// Sequential forward-only scan. Faster than building a parse tree because the
+// payload fields arrive in a known, stable order.
+
+type fastFields struct {
+	amount         float32
+	installments   float32
+	requestedAt    []byte
+	customerAvg    float32
+	txCount24h     float32
+	knownMerchants []byte // raw bytes between [ and ] of known_merchants array
+	merchantID     []byte
+	merchantMCC    []byte
+	merchantAvg    float32
+	isOnline       bool
+	cardPresent    bool
+	kmFromHome     float32
+	hasLastTx      bool
+	lastTimestamp  []byte
+	kmFromCurrent  float32
+}
+
+func parseFastFields(body []byte) (fastFields, bool) {
+	var f fastFields
+	pos := 0
+	if !scanNum(body, &pos, `"amount"`, &f.amount) {
+		return f, false
+	}
+	if !scanNum(body, &pos, `"installments"`, &f.installments) {
+		return f, false
+	}
+	if !scanStr(body, &pos, `"requested_at"`, &f.requestedAt) {
+		return f, false
+	}
+	if !scanNum(body, &pos, `"avg_amount"`, &f.customerAvg) {
+		return f, false
+	}
+	if !scanNum(body, &pos, `"tx_count_24h"`, &f.txCount24h) {
+		return f, false
+	}
+	if !scanArr(body, &pos, `"known_merchants"`, &f.knownMerchants) {
+		return f, false
+	}
+	if !scanStr(body, &pos, `"id"`, &f.merchantID) {
+		return f, false
+	}
+	if !scanStr(body, &pos, `"mcc"`, &f.merchantMCC) {
+		return f, false
+	}
+	if !scanNum(body, &pos, `"avg_amount"`, &f.merchantAvg) {
+		return f, false
+	}
+	if !scanBool(body, &pos, `"is_online"`, &f.isOnline) {
+		return f, false
+	}
+	if !scanBool(body, &pos, `"card_present"`, &f.cardPresent) {
+		return f, false
+	}
+	if !scanNum(body, &pos, `"km_from_home"`, &f.kmFromHome) {
+		return f, false
+	}
+	// last_transaction can be null or an object.
+	vp, ok := fieldValueStart(body, pos, `"last_transaction"`)
+	if !ok {
+		return f, false
+	}
+	if !bytes.HasPrefix(body[vp:], []byte("null")) {
+		pos = vp
+		f.hasLastTx = true
+		if !scanStr(body, &pos, `"timestamp"`, &f.lastTimestamp) {
+			return f, false
+		}
+		if !scanNum(body, &pos, `"km_from_current"`, &f.kmFromCurrent) {
+			return f, false
+		}
+	}
+	return f, true
+}
+
+// fieldValueStart finds the start of the JSON value for a field key,
+// searching forward from start in body. Returns (offset, true) or (0, false).
+func fieldValueStart(body []byte, start int, field string) (int, bool) {
+	rel := bytes.Index(body[start:], []byte(field))
+	if rel < 0 {
+		return 0, false
+	}
+	i := start + rel + len(field)
+	for i < len(body) && body[i] != ':' {
+		i++
+	}
+	i++ // skip ':'
+	for i < len(body) && isJSONSpace(body[i]) {
+		i++
+	}
+	if i >= len(body) {
+		return 0, false
+	}
+	return i, true
+}
+
+func scanNum(body []byte, pos *int, field string, out *float32) bool {
+	vp, ok := fieldValueStart(body, *pos, field)
+	if !ok {
+		return false
+	}
+	v, next, ok := parseNumAt(body, vp)
+	if !ok {
+		return false
+	}
+	*out = v
+	*pos = next
+	return true
+}
+
+func scanStr(body []byte, pos *int, field string, out *[]byte) bool {
+	vp, ok := fieldValueStart(body, *pos, field)
+	if !ok {
+		return false
+	}
+	v, next, ok := parseStrAt(body, vp)
+	if !ok {
+		return false
+	}
+	*out = v
+	*pos = next
+	return true
+}
+
+func scanArr(body []byte, pos *int, field string, out *[]byte) bool {
+	vp, ok := fieldValueStart(body, *pos, field)
+	if !ok {
+		return false
+	}
+	v, next, ok := parseArrAt(body, vp)
+	if !ok {
+		return false
+	}
+	*out = v
+	*pos = next
+	return true
+}
+
+func scanBool(body []byte, pos *int, field string, out *bool) bool {
+	vp, ok := fieldValueStart(body, *pos, field)
+	if !ok {
+		return false
+	}
+	v, next, ok := parseBoolAt(body, vp)
+	if !ok {
+		return false
+	}
+	*out = v
+	*pos = next
+	return true
+}
+
+func parseNumAt(body []byte, i int) (float32, int, bool) {
+	neg := false
+	if i < len(body) && body[i] == '-' {
+		neg = true
+		i++
+	}
+	var v float32
+	digits := 0
+	for i < len(body) && body[i] >= '0' && body[i] <= '9' {
+		v = v*10 + float32(body[i]-'0')
+		i++
+		digits++
+	}
+	if i < len(body) && body[i] == '.' {
+		i++
+		scale := float32(0.1)
+		for i < len(body) && body[i] >= '0' && body[i] <= '9' {
+			v += float32(body[i]-'0') * scale
+			scale *= 0.1
+			i++
+			digits++
+		}
+	}
+	if digits == 0 {
+		return 0, i, false
+	}
+	// Skip over rare scientific notation (e.g. 1e2) without parsing precisely.
+	if i < len(body) && (body[i] == 'e' || body[i] == 'E') {
+		i++
+		if i < len(body) && (body[i] == '+' || body[i] == '-') {
+			i++
+		}
+		for i < len(body) && body[i] >= '0' && body[i] <= '9' {
+			i++
+		}
+	}
+	if neg {
+		return -v, i, true
+	}
+	return v, i, true
+}
+
+func parseStrAt(body []byte, i int) ([]byte, int, bool) {
+	if i >= len(body) || body[i] != '"' {
+		return nil, i, false
+	}
+	i++
+	start := i
+	for i < len(body) {
+		if body[i] == '"' && (i == start || body[i-1] != '\\') {
+			return body[start:i], i + 1, true
+		}
+		i++
+	}
+	return nil, i, false
+}
+
+func parseArrAt(body []byte, i int) ([]byte, int, bool) {
+	if i >= len(body) || body[i] != '[' {
+		return nil, i, false
+	}
+	i++
+	start := i
+	for i < len(body) {
+		switch body[i] {
+		case ']':
+			return body[start:i], i + 1, true
+		case '"':
+			i++
+			for i < len(body) && body[i] != '"' {
+				if body[i] == '\\' {
+					i++
+				}
+				i++
+			}
+		}
+		i++
+	}
+	return nil, i, false
+}
+
+func parseBoolAt(body []byte, i int) (bool, int, bool) {
+	if bytes.HasPrefix(body[i:], []byte("true")) {
+		return true, i + 4, true
+	}
+	if bytes.HasPrefix(body[i:], []byte("false")) {
+		return false, i + 5, true
+	}
+	return false, i, false
+}
+
+func isJSONSpace(c byte) bool {
+	return c == ' ' || c == '\n' || c == '\r' || c == '\t'
+}
+
+// knownMerchant reports whether merchantID appears in the flat string array bytes.
+func knownMerchant(arr, id []byte) bool {
+	i := 0
+	for i < len(arr) {
+		if arr[i] != '"' {
+			i++
+			continue
+		}
+		i++
+		start := i
+		for i < len(arr) && arr[i] != '"' {
+			i++
+		}
+		if bytes.Equal(arr[start:i], id) {
+			return true
+		}
+		i++
+	}
+	return false
+}
+
+// ── Request scoring ───────────────────────────────────────────────────────────
+
+// scoreFraudBody parses a /fraud-score body and returns a pre-built HTTP response.
+// The decision tree handles all cases; the ratio fallback covers malformed payloads.
+func scoreFraudBody(body []byte) []byte {
+	f, ok := parseFastFields(body)
+	if !ok {
+		return scoreRatioFallback(body)
+	}
+
+	safeAvg := f.customerAvg
+	if safeAvg <= 0 {
+		safeAvg = 1
+	}
+	amountRatio := f.amount / safeAvg
+	known := knownMerchant(f.knownMerchants, f.merchantID)
+
+	// Fast-path: obviously legitimate.
+	if f.amount <= 500 && amountRatio <= 0.5 &&
+		f.installments <= 3 && f.txCount24h <= 5 && known &&
+		f.kmFromHome <= 50 && isSafeMCC(f.merchantMCC) {
+		return httpApproved
+	}
+
+	// Fast-path: obviously fraudulent.
+	if f.amount >= 5000 && f.installments >= 5 && f.txCount24h >= 6 &&
+		!known && f.kmFromHome >= 150 && isRiskyMCC(f.merchantMCC) {
+		return httpDenied
+	}
+
+	cfg := globalNorm
+
+	// Build 21-dim feature vector (indices match gen_tree.py feature list).
+	var vec [treeDims]float32
+
+	// Features 0–13: normalised (same as before).
+	vec[0] = clamp32(f.amount * cfg.InvMaxAmount)
+	vec[1] = clamp32(f.installments * cfg.InvMaxInstallments)
+	vec[2] = clamp32(amountRatio * cfg.InvAmountVsAvgRatio)
+	hour, weekday, epochSec := parseTS(f.requestedAt)
+	vec[3] = float32(hour) / 23.0
+	vec[4] = float32(weekday) / 6.0
+
+	if !f.hasLastTx {
+		vec[5] = -1.0
+		vec[6] = -1.0
+		vec[14] = 1.0 // last_null flag
+	} else {
+		_, _, lastEpoch := parseTS(f.lastTimestamp)
+		minutes := float32(epochSec-lastEpoch) / 60.0
+		vec[5] = clamp32(minutes * cfg.InvMaxMinutes)
+		vec[6] = clamp32(f.kmFromCurrent * cfg.InvMaxKm)
+		vec[14] = 0.0
+	}
+
+	vec[7] = clamp32(f.kmFromHome * cfg.InvMaxKm)
+	vec[8] = clamp32(f.txCount24h * cfg.InvMaxTxCount24h)
+	if f.isOnline {
+		vec[9] = 1.0
+	}
+	if f.cardPresent {
+		vec[10] = 1.0
+	}
+	if !known {
+		vec[11] = 1.0
+	}
+	if risk, ok := globalMCCRisk[string(f.merchantMCC)]; ok {
+		vec[12] = risk
+	} else {
+		vec[12] = 0.5
+	}
+	vec[13] = clamp32(f.merchantAvg * cfg.InvMaxMerchantAvgAmount)
+
+	// Features 14–20: raw (unnormalized) values — give the tree extra signal.
+	// vec[14] already set above (last_null).
+	vec[15] = f.amount
+	vec[16] = safeAvg
+	vec[17] = amountRatio
+	vec[18] = f.txCount24h
+	vec[19] = f.kmFromHome
+	vec[20] = f.merchantAvg
+
+	fraud, _ := treePredict(&vec)
+	if fraud {
+		return httpDenied
+	}
+	return httpApproved
+}
+
+// scoreRatioFallback is used when the full JSON parser fails.
+// It extracts only amount/avg_amount for a best-effort decision.
+func scoreRatioFallback(body []byte) []byte {
+	amount, ok := extractNestedFloat(body, []byte(`"transaction"`), []byte(`"amount"`))
+	if !ok {
+		return httpBadReq
+	}
+	avg, _ := extractNestedFloat(body, []byte(`"customer"`), []byte(`"avg_amount"`))
+	if avg <= 0 {
+		avg = 1
+	}
+	if amount/avg >= 10 { // rough threshold matching amount_vs_avg_ratio
+		return httpDenied
+	}
+	return httpApproved
+}
+
 // extractNestedFloat scans raw JSON bytes for objectKey → fieldKey: <number>.
-// Returns (value, true) or (0, false) if not found. Zero-allocation, no regexp.
 func extractNestedFloat(body, objectKey, fieldKey []byte) (float64, bool) {
 	pos := bytes.Index(body, objectKey)
 	if pos < 0 {
@@ -1212,7 +1709,7 @@ func extractNestedFloat(body, objectKey, fieldKey []byte) (float64, bool) {
 	for pos < len(body) && body[pos] != ':' {
 		pos++
 	}
-	pos++ // skip ':'
+	pos++
 	for pos < len(body) && (body[pos] == ' ' || body[pos] == '\t' || body[pos] == '\r' || body[pos] == '\n') {
 		pos++
 	}
@@ -1247,228 +1744,7 @@ func extractNestedFloat(body, objectKey, fieldKey []byte) (float64, bool) {
 	return v, true
 }
 
-// scoreRatioFallback extracts only amount and customer avg_amount from raw JSON bytes
-// and returns a fraud decision based on the amount-to-average ratio.
-// Used when full JSON parsing fails completely.
-func scoreRatioFallback(body []byte, norm NormConfig) (approved bool, bucket int, ok bool) {
-	amount, ok1 := extractNestedFloat(body, []byte(`"transaction"`), []byte(`"amount"`))
-	if !ok1 {
-		return false, 0, false
-	}
-	avg, _ := extractNestedFloat(body, []byte(`"customer"`), []byte(`"avg_amount"`))
-	if avg <= 0 {
-		avg = 1
-	}
-	ratio := clamp32(float32(amount/avg) * norm.InvAmountVsAvgRatio)
-	approved = ratio < fraudThresh
-	bucket = int(ratio*100 + 0.5)
-	if bucket > 100 {
-		bucket = 100
-	}
-	return approved, bucket, true
-}
-
-func handleReady(ctx *fasthttp.RequestCtx) {
-	ctx.SetStatusCode(fasthttp.StatusOK)
-	ctx.SetBodyString("OK")
-}
-
-func handleFraudScore(ctx *fasthttp.RequestCtx) {
-	p := parserPool.Get()
-	defer parserPool.Put(p)
-
-	v, err := p.ParseBytes(ctx.PostBody())
-	if err != nil {
-		// Ratio fallback: parse only amount + avg_amount for a quick decision.
-		if approved, bucket, ok := scoreRatioFallback(ctx.PostBody(), globalNorm); ok {
-			ctx.SetContentTypeBytes(jsonCT)
-			if approved {
-				ctx.SetBody(approvedResponses[bucket])
-			} else {
-				ctx.SetBody(deniedResponses[bucket])
-			}
-			return
-		}
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		return
-	}
-
-	// ── Extract fields (fastjson returns []byte backed by input — no alloc) ──
-
-	txn := v.Get("transaction")
-	cust := v.Get("customer")
-	merch := v.Get("merchant")
-	term := v.Get("terminal")
-
-	if txn == nil || cust == nil || merch == nil || term == nil {
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		return
-	}
-
-	amount := float32(txn.GetFloat64("amount"))
-	installments := float32(txn.GetInt("installments"))
-	reqAt := txn.GetStringBytes("requested_at")
-
-	avgAmount := float32(cust.GetFloat64("avg_amount"))
-	txCount24h := float32(cust.GetInt("tx_count_24h"))
-	knownMerchants := cust.GetArray("known_merchants")
-
-	merchantID := merch.GetStringBytes("id")
-	mccBytes := merch.GetStringBytes("mcc")
-	merchantAvg := float32(merch.GetFloat64("avg_amount"))
-
-	isOnline := term.GetBool("is_online")
-	cardPresent := term.GetBool("card_present")
-	kmFromHome := float32(term.GetFloat64("km_from_home"))
-
-	lastTx := v.Get("last_transaction")
-
-	// ── Compute known early (reused in fast-paths and vectorization) ──────────
-	known := false
-	for _, km := range knownMerchants {
-		if bytes.Equal(km.GetStringBytes(), merchantID) {
-			known = true
-			break
-		}
-	}
-
-	// ── Fast-path: obviously legitimate (ALL conditions must hold) ────────────
-	// Small amount below half the customer average, few installments, low
-	// recent-tx velocity, known merchant, near home, safe MCC category.
-	if amount <= 500 && avgAmount > 0 && (amount/avgAmount) <= 0.5 &&
-		installments <= 3 && txCount24h <= 5 && known &&
-		kmFromHome <= 50 && isSafeMCC(mccBytes) {
-		ctx.SetContentTypeBytes(jsonCT)
-		ctx.SetBody(approvedResponses[0])
-		return
-	}
-
-	// ── Fast-path: obviously fraudulent (ALL conditions must hold) ────────────
-	// Large amount, many installments, high velocity, unknown merchant,
-	// far from home, and in a high-risk MCC category.
-	if amount >= 5000 && installments >= 5 && txCount24h >= 6 &&
-		!known && kmFromHome >= 150 && isRiskyMCC(mccBytes) {
-		ctx.SetContentTypeBytes(jsonCT)
-		ctx.SetBody(deniedResponses[100])
-		return
-	}
-
-	// ── Normalize → 14-dim float32 vector ────────────────────────────────────
-	cfg := globalNorm
-	var vec [dims]float32
-
-	// 0. amount / max_amount
-	vec[0] = clamp32(amount * cfg.InvMaxAmount)
-
-	// 1. installments / max_installments
-	vec[1] = clamp32(installments * cfg.InvMaxInstallments)
-
-	// 2. (amount / avg_amount) / amount_vs_avg_ratio
-	if avgAmount <= 0 {
-		avgAmount = 1
-	}
-	vec[2] = clamp32((amount / avgAmount) * cfg.InvAmountVsAvgRatio)
-
-	// 3. hour_of_day / 23  &  4. day_of_week / 6
-	hour, weekday, epochSec := parseTS(reqAt)
-	vec[3] = float32(hour) / 23.0
-	vec[4] = float32(weekday) / 6.0
-
-	// 5 & 6. last_transaction (or -1 sentinel)
-	if lastTx == nil || lastTx.Type() == fastjson.TypeNull {
-		vec[5] = -1.0
-		vec[6] = -1.0
-	} else {
-		lastTs := lastTx.GetStringBytes("timestamp")
-		kmFromCurrent := float32(lastTx.GetFloat64("km_from_current"))
-		_, _, lastEpoch := parseTS(lastTs)
-		minutes := float32(epochSec-lastEpoch) / 60.0
-		vec[5] = clamp32(minutes * cfg.InvMaxMinutes)
-		vec[6] = clamp32(kmFromCurrent * cfg.InvMaxKm)
-	}
-
-	// 7. km_from_home / max_km
-	vec[7] = clamp32(kmFromHome * cfg.InvMaxKm)
-
-	// 8. tx_count_24h / max_tx_count_24h
-	vec[8] = clamp32(txCount24h * cfg.InvMaxTxCount24h)
-
-	// 9. is_online
-	if isOnline {
-		vec[9] = 1.0
-	}
-
-	// 10. card_present
-	if cardPresent {
-		vec[10] = 1.0
-	}
-
-	// 11. unknown_merchant (1 = unknown, 0 = known) — computed above for fast-paths
-	if !known {
-		vec[11] = 1.0
-	}
-
-	// 12. mcc_risk (default 0.5)
-	if risk, ok := globalMCCRisk[string(mccBytes)]; ok { // string([]byte) in map lookup: no alloc (Go compiler opt)
-		vec[12] = risk
-	} else {
-		vec[12] = 0.5
-	}
-
-	// 13. merchant avg_amount / max_merchant_avg_amount
-	vec[13] = clamp32(merchantAvg * cfg.InvMaxMerchantAvgAmount)
-
-	// ── Decision tree (primary classifier) ───────────────────────────────────
-	// If the tree is confident (leaf purity >= treeConfidenceThreshold), return
-	// immediately without the expensive HIVF k-NN search.
-	if treeFraud, treeConfident := treePredict(&vec); treeConfident {
-		ctx.SetContentTypeBytes(jsonCT)
-		if treeFraud {
-			ctx.SetBody(deniedResponses[100])
-		} else {
-			ctx.SetBody(approvedResponses[0])
-		}
-		return
-	}
-
-	// ── Quantize to int16 (with feature weights baked in) ────────────────────
-	var q [stride]int16 // last 2 elements stay 0 (SIMD padding)
-	for i, fv := range vec {
-		q[i] = quantizeF32(fv * featureWeights[i])
-	}
-
-	// ── HIVF search (fallback for uncertain tree cases) ───────────────────────
-	score := globalIdx.scoreRequest(&q)
-
-	// ── Return pre-computed response ─────────────────────────────────────────
-	approved := score < fraudThresh
-	bucket := int(score*100 + 0.5)
-	if bucket > 100 {
-		bucket = 100
-	}
-	ctx.SetContentTypeBytes(jsonCT)
-	if approved {
-		ctx.SetBody(approvedResponses[bucket])
-	} else {
-		ctx.SetBody(deniedResponses[bucket])
-	}
-}
-
-func requestHandler(ctx *fasthttp.RequestCtx) {
-	path := ctx.Path()
-	method := ctx.Method()
-
-	switch {
-	case bytes.Equal(path, []byte("/ready")) && bytes.Equal(method, []byte("GET")):
-		handleReady(ctx)
-	case bytes.Equal(path, []byte("/fraud-score")) && bytes.Equal(method, []byte("POST")):
-		handleFraudScore(ctx)
-	default:
-		ctx.SetStatusCode(fasthttp.StatusNotFound)
-	}
-}
-
-// ── Build mode ───────────────────────────────────────────────────────────────
+// ── Build mode ────────────────────────────────────────────────────────────────
 
 func cmdBuild(args []string) {
 	fs := flag.NewFlagSet("build", flag.ExitOnError)
@@ -1554,8 +1830,8 @@ func bindDGRAMSocket(path string) (int, error) {
 }
 
 // recvFDLoop blocks on recvmsg, receiving client fds from the LB.
-// For each received fd, wraps it as a net.Conn and calls srv.ServeConn in a goroutine.
-func recvFDLoop(udsFd int, srv *fasthttp.Server) {
+// For each received fd, wraps it as a net.Conn and calls handleConn in a goroutine.
+func recvFDLoop(udsFd int) {
 	const oobSize = 256 // CMSG_SPACE(sizeof(int)) ≈ 24; 256 is ample
 	oob := make([]byte, oobSize)
 	dummy := make([]byte, 1)
@@ -1588,10 +1864,7 @@ func recvFDLoop(udsFd int, srv *fasthttp.Server) {
 			continue
 		}
 
-		go func() {
-			defer conn.Close()
-			srv.ServeConn(conn)
-		}()
+		go handleConn(conn)
 	}
 }
 
@@ -1601,11 +1874,11 @@ func cmdServe(args []string) {
 	fs.Parse(args)
 
 	remaining := fs.Args()
-	if len(remaining) < 3 {
-		fmt.Fprintln(os.Stderr, "Usage: rinha serve <index.bin> <norm.json> <mcc.json> [flags]")
+	if len(remaining) < 2 {
+		fmt.Fprintln(os.Stderr, "Usage: rinha serve <norm.json> <mcc.json> [flags]")
 		os.Exit(1)
 	}
-	idxPath, normPath, mccPath := remaining[0], remaining[1], remaining[2]
+	normPath, mccPath := remaining[0], remaining[1]
 
 	// Override port from env (container-friendly)
 	if p := os.Getenv("SERVER_PORT"); p != "" {
@@ -1628,47 +1901,18 @@ func cmdServe(args []string) {
 	// Lock to 1 OS thread immediately — each container has exactly 1 CPU (cpuset).
 	runtime.GOMAXPROCS(1)
 
-	// Disable GC: hot path has near-zero allocations (pooled parsers, stack arrays).
+	// Disable GC: hot path has near-zero allocations (stack arrays, buffer reuse).
 	// Eliminates GC-induced latency spikes that inflate p99.
 	debug.SetGCPercent(-1)
 
-	// Load index via mmap — both API instances share the same OS page cache,
-	// halving the effective RAM footprint compared to heap allocation.
-	globalIdx, err = mmapIndex(idxPath)
-	if err != nil {
-		log.Fatalf("mmap index: %v", err)
-	}
-
-	// Fault all 84MB of quantized vectors into RAM before accepting connections.
-	// Prevents OS page-fault latency spikes on first requests.
-	preWarmIndex(globalIdx)
-
 	// Lock all current pages in RAM so the OS cannot evict them under memory
 	// pressure. Eliminates page-fault latency spikes during sustained load.
-	// Requires memlock ulimit ≥ RSS (set to -1/unlimited in docker-compose).
 	if err := syscall.Mlockall(syscall.MCL_CURRENT); err != nil {
 		log.Printf("[serve] mlockall: %v (non-fatal, latency may vary)", err)
 	}
 
-	srv := &fasthttp.Server{
-		Handler:                       requestHandler,
-		Name:                          "rinha",
-		NoDefaultDate:                 true,
-		NoDefaultServerHeader:         true,
-		DisableHeaderNamesNormalizing: true,
-		MaxConnsPerIP:                 0,
-		Concurrency:                   4096,
-		ReadBufferSize:                512,
-		WriteBufferSize:               256,
-		ReadTimeout:                   5000000000,
-		WriteTimeout:                  5000000000,
-		TCPKeepalive:                  true,
-	}
-
 	if socketPath != "" {
 		// FD-passing mode: receive client fds from the Go LB via Unix DGRAM + SCM_RIGHTS.
-		// The LB accepts TCP connections and passes each fd here via sendmsg/SCM_RIGHTS.
-		// This eliminates the proxy double-copy: the API handles the raw TCP fd directly.
 		log.Printf("[serve] FD-passing mode on unix-dgram:%s", socketPath)
 		os.Remove(socketPath) // clean up leftover from previous run
 
@@ -1677,11 +1921,19 @@ func cmdServe(args []string) {
 			log.Fatalf("bind DGRAM socket %s: %v", socketPath, err)
 		}
 		log.Printf("[serve] ready, receiving fds from LB")
-		recvFDLoop(udsFd, srv)
+		recvFDLoop(udsFd)
 	} else {
+		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
+		if err != nil {
+			log.Fatalf("listen: %v", err)
+		}
 		log.Printf("[serve] listening on :%d", *port)
-		if err := srv.ListenAndServe(fmt.Sprintf(":%d", *port)); err != nil {
-			log.Fatalf("server tcp: %v", err)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				continue
+			}
+			go handleConn(conn)
 		}
 	}
 }

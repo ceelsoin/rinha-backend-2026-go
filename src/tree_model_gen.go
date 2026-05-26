@@ -29,8 +29,8 @@ var treeNodes = []treeNode{
 
 // treePredict traverses the compiled decision tree.
 // Returns (isFraud bool, confident bool).
-// confident=false means the HIVF index should be consulted instead.
-func treePredict(f *[dims]float32) (fraud bool, confident bool) {
+// confident is always true when the tree is used as the sole classifier.
+func treePredict(f *[treeDims]float32) (fraud bool, confident bool) {
 	i := 0
 	for {
 		n := treeNodes[i]

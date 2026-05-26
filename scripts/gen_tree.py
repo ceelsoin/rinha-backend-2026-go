@@ -8,10 +8,10 @@ Usage:
 The reference JSON has items:
     {"vector": [f0..f13], "label": "legit"|"fraud"}
 
-Feature indices match Go's handleFraudScore() normalization (pre-weight):
-    0  amount / max_amount
-    1  installments / max_installments
-    2  (amount / avg_amount) / amount_vs_avg_ratio
+Feature indices (21 total) match Go's scoreFraudBody() order:
+    0  amount / max_amount                        (normalised)
+    1  installments / max_installments            (normalised)
+    2  (amount / avg_amount) / amount_vs_avg_ratio (normalised)
     3  hour / 23
     4  weekday / 6
     5  minutes_since_last / max_minutes  (-1 if no last tx)
@@ -23,6 +23,13 @@ Feature indices match Go's handleFraudScore() normalization (pre-weight):
     11 unknown_merchant (0=known, 1=unknown)
     12 mcc_risk
     13 merchant_avg / max_merchant_avg
+    14 last_null (1.0 if no last tx, else 0.0)
+    15 amount (raw)
+    16 customer avg_amount (raw)
+    17 amount / avg_amount ratio (raw)
+    18 tx_count_24h (raw)
+    19 km_from_home (raw)
+    20 merchant avg_amount (raw)
 """
 from __future__ import annotations
 
@@ -32,11 +39,36 @@ import sys
 from pathlib import Path
 
 
+# Normalization constants (must match NormConfig defaults in main.go).
+MAX_AMOUNT            = 10_000.0
+MAX_INSTALLMENTS      = 12.0
+AMOUNT_VS_AVG_RATIO   = 10.0
+MAX_MINUTES           = 1_440.0
+MAX_KM                = 1_000.0
+MAX_TX_COUNT_24H      = 20.0
+MAX_MERCHANT_AVG      = 10_000.0
+
+
+def expand_features(v: list[float]) -> list[float]:
+    """Expand 14-dim normalised vector to 21-dim by adding raw (unnormalised) extras."""
+    # Reconstruct raw values from normalised ones.
+    raw_amount       = v[0] * MAX_AMOUNT
+    raw_tx_count     = v[8] * MAX_TX_COUNT_24H
+    raw_km_home      = v[7] * MAX_KM
+    raw_merchant_avg = v[13] * MAX_MERCHANT_AVG
+    last_null        = 1.0 if v[5] == -1.0 else 0.0
+    # v[2] = (amount/avg) / ratio  =>  amount/avg = v[2]*ratio  =>  avg = amount/(v[2]*ratio)
+    ratio_norm = v[2] * AMOUNT_VS_AVG_RATIO  # amount / avg_amount
+    raw_avg = raw_amount / ratio_norm if ratio_norm > 0 else raw_amount
+    raw_ratio = ratio_norm  # amount / avg_amount (raw, unnormalised)
+    return list(v) + [last_null, raw_amount, raw_avg, raw_ratio, raw_tx_count, raw_km_home, raw_merchant_avg]
+
+
 def load_references(path: str):
     opener = gzip.open if path.endswith(".gz") else open
     with opener(path, "rt", encoding="utf-8") as fh:
         data = json.load(fh)
-    X = [entry["vector"] for entry in data]
+    X = [expand_features(entry["vector"]) for entry in data]
     y = [1 if entry["label"] == "fraud" else 0 for entry in data]
     return X, y
 
@@ -103,8 +135,8 @@ def emit_go(clf, n_train: int, out_path: str) -> None:
         "",
         "// treePredict traverses the compiled decision tree.",
         "// Returns (isFraud bool, confident bool).",
-        "// confident=false means the HIVF index should be consulted instead.",
-        "func treePredict(f *[dims]float32) (fraud bool, confident bool) {",
+        "// confident is always true when the tree is used as the sole classifier.",
+        "func treePredict(f *[treeDims]float32) (fraud bool, confident bool) {",
         "\ti := 0",
         "\tfor {",
         "\t\tn := treeNodes[i]",
