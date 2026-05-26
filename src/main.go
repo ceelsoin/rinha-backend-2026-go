@@ -42,10 +42,10 @@ const (
 	nProbeL1     = 16   // top L1 clusters to probe per query
 	nProbeL2     = 256  // top L2 clusters to probe (initial pass)
 	nProbeL2Ext  = 512  // extended probe when score is uncertain
-	nNeigh       = 7    // k-NN neighbors (was 5)
-	fraudThresh  = float32(0.44) // score >= this → not approved
-	confLow      = float32(0.38) // adaptive probe lower bound
-	confHigh     = float32(0.50) // adaptive probe upper bound
+	nNeigh       = 5    // k-NN neighbors — spec: k=5, fraud_score = frauds/5, approved < 0.6
+	fraudThresh  = float32(0.60) // spec threshold: approve if fraud_score < 0.6
+	confLow      = float32(0.38) // adaptive probe: extend when score ≥ confLow (catches 2/5=0.40)
+	confHigh     = float32(0.62) // adaptive probe: extend when score ≤ confHigh (catches 3/5=0.60)
 	nProbeRepair = 48   // centHeap backing-array size (L1 uses n=nProbeL1≤48)
 	trainSample  = 50000
 	trainItersL1 = 30
@@ -64,10 +64,7 @@ var featureWeights = [dims]float32{
 	0.8247206, 2.0315619,
 }
 
-// kernelCoeff scales L2 Euclidean distance for the Gaussian kernel exp(-L2 * kernelCoeff).
-// Calibrated to match the Rust implementation's Manhattan kernel exp(-manhattan * 0.5)
-// via manhattan ≈ sqrt(dims) * L2_euclidean → coeff = 0.5 * sqrt(14) ≈ 1.87.
-const kernelCoeff = float32(1.87)
+// kernelCoeff removed — scoring now uses simple fraud count / k, matching the official spec.
 
 // Pre-built HTTP responses: approvedResponses[i] and deniedResponses[i] for
 // fraud_score = i/100 (i = 0..100). Selected by bucket = int(score*100 + 0.5).
@@ -381,22 +378,13 @@ func (h *neighHeap) fraudCount() int {
 	return n
 }
 
-// distWeightedScore computes a Gaussian kernel-weighted fraud score from the k neighbors.
-// weight_i = exp(-L2_euclidean_i * kernelCoeff), score = sum(w_i * label_i) / sum(w_i).
-// This gives closer neighbors more influence than distant ones, matching the Rust top1-new impl.
+// distWeightedScore returns fraud_score = (number of fraud neighbors) / k.
+// Matches the official spec exactly: k=5, simple majority count, threshold 0.6.
 func (h *neighHeap) distWeightedScore() float32 {
-	var fraudW, totalW float32
-	for i := 0; i < h.size; i++ {
-		// Convert int32 squared-L2 (int16 ×10000 units) to float L2 euclidean in [0, ~sqrt(14)].
-		distL2 := float32(math.Sqrt(float64(h.d[i]))) / 10000.0
-		w := float32(math.Exp(float64(-distL2 * kernelCoeff)))
-		totalW += w
-		fraudW += w * float32(h.lbl[i])
-	}
-	if totalW <= 0 {
+	if h.size == 0 {
 		return 0
 	}
-	return fraudW / totalW
+	return float32(h.fraudCount()) / float32(h.size)
 }
 
 // ── distIdx partial-sort helpers ─────────────────────────────────────────────

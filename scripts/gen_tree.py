@@ -67,8 +67,8 @@ def emit_go(clf, n_train: int, out_path: str) -> None:
         "const treeLeafFeature int8 = -1",
         "",
         "// treeConfidenceThreshold: leaf purity must be >= this to skip the HIVF index.",
-        "// Tune lower to trust the tree more; higher to rely more on HIVF for edge cases.",
-        "const treeConfidenceThreshold float32 = 0.88",
+        "// 0.80 means 80% of training samples in this leaf agree on the prediction.",
+        "const treeConfidenceThreshold float32 = 0.80",
         "",
         f"// treeNodes holds the compiled decision tree ({n_nodes} nodes, {n_train} training samples).",
         "var treeNodes = []treeNode{",
@@ -141,14 +141,14 @@ def main() -> None:
     from sklearn.tree import DecisionTreeClassifier
 
     clf = DecisionTreeClassifier(
-        max_depth=12,
-        min_samples_leaf=50,
-        min_impurity_decrease=1e-6,
+        max_depth=15,
+        min_samples_leaf=20,
+        min_impurity_decrease=0,
         random_state=42,
         class_weight="balanced",
     )
     print(
-        "[gen_tree] training DecisionTreeClassifier(max_depth=12, min_samples_leaf=50) ...",
+        "[gen_tree] training DecisionTreeClassifier(max_depth=15, min_samples_leaf=20) ...",
         flush=True,
     )
     clf.fit(X, y)
