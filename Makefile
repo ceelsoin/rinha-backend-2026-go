@@ -1,4 +1,4 @@
-IMAGE := ceelsoinacio/rinha-backend-2026:latest
+IMAGE := ceelsoinacio/rinha-backend-2026:v2
 
 build:
 	docker build -t $(IMAGE) .
