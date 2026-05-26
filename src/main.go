@@ -93,6 +93,7 @@ type HIVFIndex struct {
 	offsets []uint32 // l2KTotal+1: offsets[i] = start in vecs for L2 cluster i
 	vecs    []int16  // n × stride, sorted by L2 cluster assignment
 	labels  []uint8  // n: 1=fraud, 0=legit
+	mapped  []byte   // non-nil when index is mmap'd; kept alive for GC safety
 }
 
 // distIdx pairs a distance with a cluster index for partial-sort helpers.
@@ -946,6 +947,83 @@ func readIndex(path string) (*HIVFIndex, error) {
 	}, nil
 }
 
+// mmapIndex maps references.bin directly into process memory without copying.
+// Both api1 and api2 containers share the same OS page cache for the file
+// (same read-only image layer → same inode → same physical pages), so the
+// effective RAM cost is ~84 MB once instead of 2×84 MB heap allocations.
+//
+// The returned *HIVFIndex has slices that point into the mmap'd region.
+// The 'mapped' field keeps the region reachable so it is never collected.
+func mmapIndex(path string) (*HIVFIndex, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	size := int(fi.Size())
+
+	mapped, err := syscall.Mmap(int(f.Fd()), 0, size,
+		syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		return nil, fmt.Errorf("mmap: %w", err)
+	}
+
+	if len(mapped) < 16 {
+		syscall.Munmap(mapped) //nolint
+		return nil, fmt.Errorf("index too small (%d bytes)", size)
+	}
+
+	// ── Parse fixed header ───────────────────────────────────────────────────
+	var magic [8]byte
+	copy(magic[:], mapped[:8])
+	if magic != hivfMagic {
+		syscall.Munmap(mapped) //nolint
+		return nil, fmt.Errorf("bad magic (got %q, want %q)", magic, hivfMagic)
+	}
+	// mapped[8:12] = version (skip)
+	n := int(binary.LittleEndian.Uint32(mapped[12:16]))
+
+	// ── Build typed slice headers over the mmap'd region ────────────────────
+	// All data is little-endian; amd64 is LE → direct cast is correct.
+	// Alignment: header is 16 bytes; subsequent arrays are 2-byte (int16) or
+	// 4-byte (uint32) aligned — all offsets below satisfy these requirements.
+	cur := 16
+
+	toI16 := func(count int) []int16 {
+		b := mapped[cur : cur+count*2]
+		cur += count * 2
+		return unsafe.Slice((*int16)(unsafe.Pointer(&b[0])), count)
+	}
+	toU32 := func(count int) []uint32 {
+		b := mapped[cur : cur+count*4]
+		cur += count * 4
+		return unsafe.Slice((*uint32)(unsafe.Pointer(&b[0])), count)
+	}
+
+	l1Cent := toI16(l1K * stride)
+	l2Cent := toI16(l2KTotal * stride)
+	offsets := toU32(l2KTotal + 1)
+	vecs := toI16(n * stride)
+	labels := mapped[cur : cur+n]
+
+	log.Printf("[serve] mmap'd HIVF index: n=%d L1=%d L2=%d (%.1f MB)",
+		n, l1K, l2KTotal, float64(size)/(1<<20))
+	return &HIVFIndex{
+		n:       n,
+		l1Cent:  l1Cent,
+		l2Cent:  l2Cent,
+		offsets: offsets,
+		vecs:    vecs,
+		labels:  labels,
+		mapped:  mapped,
+	}, nil
+}
+
 
 // ── References loader ────────────────────────────────────────────────────────
 
@@ -1389,10 +1467,11 @@ func cmdServe(args []string) {
 	// Eliminates GC-induced latency spikes that inflate p99.
 	debug.SetGCPercent(-1)
 
-	// Load index
-	globalIdx, err = readIndex(idxPath)
+	// Load index via mmap — both API instances share the same OS page cache,
+	// halving the effective RAM footprint compared to heap allocation.
+	globalIdx, err = mmapIndex(idxPath)
 	if err != nil {
-		log.Fatalf("read index: %v", err)
+		log.Fatalf("mmap index: %v", err)
 	}
 
 	// Fault all 84MB of quantized vectors into RAM before accepting connections.

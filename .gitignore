@@ -1,4 +1,5 @@
 src/go
 .DS_Store
 *.log
-tests/test/results.json
+test/test/results.json
+top1/

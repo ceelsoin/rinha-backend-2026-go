@@ -95,6 +95,61 @@ Estimated Docker build time: **4–8 minutes** (dominated by k-means training on
 
 ---
 
+---
+
+## Etapas de implementação (priorizadas por impacto)
+
+### ✅ Etapa 1 — HIVF + adaptive probing + k=7 **[IMPLEMENTADO]**
+**Objetivo:** reduzir records escaneados por query, melhorar recall e eliminar o repair scan caro.
+
+| Mudança | Detalhe |
+|---|---|
+| Índice 2-níveis (HIVF) | 256 L1 super-centroids × 256 L2 sub-centroids = 65.536 clusters; ~45 records/cluster |
+| nProbeL1=16, nProbeL2=256 | Escaneia apenas ~11.500 records vs ~17.500 antes |
+| Adaptive probing | Se score ∈ [0.38, 0.50] estende para 512 L2 clusters em vez de scan total do índice |
+| k=7 vizinhos (era 5) | Melhor precisão com custo linear baixo |
+| Threshold 0.44 (era 0.60) | Equivalente a maioria estrita, calibrado para k=7 |
+| Binary format novo | Novo magic `GOHIVF01`, layout: l1Cent + l2Cent + offsets + vecs + labels |
+
+### ✅ Etapa 2 — Feature encoding + pesos por dimensão **[IMPLEMENTADO]**
+**Objetivo:** melhorar qualidade do vetor de query para maior separabilidade.
+
+| Mudança | Detalhe |
+|---|---|
+| Codificação cíclica hora/dia | `sin(h×2π/24)`, `cos(h×2π/24)` em vez de linear `h/23` |
+| Log para amount | `ln(1+x)/ln(1+max)` em vez de `x/max` |
+| Pesos por dimensão | Multiplicar cada dim antes de quantizar (build + query) |
+| ⚠️ Requer rebuild | Precisa re-indexar para que referências e queries usem o mesmo encoding |
+
+### ✅ Etapa 3 — AVX2 + distância Manhattan **[IMPLEMENTADO]**
+**Objetivo:** ~2× speedup no inner loop de distância (o gargalo real de CPU).
+
+| Mudança | Detalhe |
+|---|---|
+| Upgrade SSE4.1 → AVX2 | Registros 256-bit: 16 int16 por instrução vs 8 |
+| Manhattan distance | `|a-b|` via `VPSIGNW/VPABSW` — elimina multiplicação vs L2² |
+| Re-clusterizar com Manhattan | O índice precisa ser construído com a mesma métrica |
+
+### ✅ Etapa 4 — Load balancer com FD passing **[IMPLEMENTADO]**
+**Objetivo:** eliminar overhead de proxy TCP do nginx (~10-20µs/req de copy extra).
+
+| Mudança | Detalhe |
+|---|---|
+| LB em Go (binary separado) | `accept()` na porta 9999, passa FD via `SCM_RIGHTS` para api1/api2 |
+| Unix Domain Socket | Worker recebe o socket TCP diretamente, sem double-copy de dados |
+| CPU budget | LB em Go usa <0.05 CPU, libera 0.05 CPU para cada api |
+
+### ✅ Etapa 5 — mmap para dados do índice **[IMPLEMENTADO]**
+**Objetivo:** compartilhar page cache entre api1 e api2 (economiza ~85 MB de RAM).
+
+| Mudança | Detalhe |
+|---|---|
+| `golang.org/x/sys/unix.Mmap` | Mapeia index.bin direto no espaço de endereços |
+| Page cache compartilhado | OS serve as mesmas páginas físicas para ambas as instâncias |
+| Lazy fault | Sem preWarm forçado; OS faz page-in on demand |
+
+---
+
 ## To-do / optimization ideas (future iterations)
 
 - [ ] **SIMD distance via CGo**: call into a small C shim using AVX2 `_mm256_madd_epi16` for the cluster scan inner loop — potential 6–8× speedup vs. scalar Go.
