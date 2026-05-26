@@ -35,8 +35,8 @@ const (
 	dims         = 14   // feature dimensions (14 input features)
 	stride       = 16   // storage stride per vector: padded to 16 int16 for 128-bit SIMD alignment
 	ivfK         = 2048 // number of IVF clusters
-	nProbe       = 8    // clusters probed per query (fast path)
-	nProbeRepair = 48   // total clusters probed when result is uncertain
+	nProbe       = 12   // clusters probed per query (fast path)
+	nProbeRepair = 48   // centHeap backing-array size; also caps sortedRepair
 	nNeigh       = 5    // k-NN neighbors
 	trainSample  = 50000
 	trainIters   = 50
@@ -220,12 +220,12 @@ func parseTS(s []byte) (int, int, int64) {
 
 // centHeap is a fixed-capacity max-heap over centroid distances used to track
 // the n nearest centroids while scanning all ivfK centroids once.
-// Capacity is always ≤ nProbeRepair so the backing arrays live on the stack.
+// Capacity is nProbe so the backing arrays live on the stack.
 type centHeap struct {
 	d    [nProbeRepair]int32
 	idx  [nProbeRepair]int32
 	size int
-	n    int // capacity: nProbe or nProbeRepair
+	n    int // capacity: nProbe
 }
 
 func (h *centHeap) maxD() int32 {
@@ -377,18 +377,22 @@ func (idx *IVFIndex) scoreRequest(q *[stride]int16) int {
 
 	fc := nh.fraudCount()
 
-	// ── Phase 3: repair when result is borderline (2 or 3 fraud among 5) ──────
-	// Re-scan all centroids with a wider probe to reduce false positives/negatives.
-	if fc == 2 || fc == 3 {
-		var ch2 centHeap
-		ch2.n = nProbeRepair
-		for ci := 0; ci < ivfK; ci++ {
-			c := (*[stride]int16)(unsafe.Pointer(&idx.centroids[ci*stride]))
-			ch2.insert(sqDist16(q, c), int32(ci))
+	// ── Phase 3: exact repair for any non-unanimous result (fc = 1..4) ────────
+	// Combined with the 12 clusters already scanned in Phase 2, this gives the
+	// exact 5-NN across all 2048 clusters — fixing false positives and negatives
+	// caused by the IVF approximation.
+	// No early stop: stopping at fc=5 would lock in fraud when a closer legit
+	// vector exists in a far-centroid cluster (the bug in the sorted approach).
+	if fc >= 1 && fc <= nNeigh-1 {
+		var skipSet [(ivfK + 63) / 64]uint64
+		for pi := 0; pi < ch.size; pi++ {
+			ci := ch.idx[pi]
+			skipSet[ci>>6] |= 1 << uint(ci&63)
 		}
-		nh = neighHeap{} // reset
-		for pi := 0; pi < ch2.size; pi++ {
-			ci := int(ch2.idx[pi])
+		for ci := 0; ci < ivfK; ci++ {
+			if skipSet[ci>>6]&(1<<uint(ci&63)) != 0 {
+				continue
+			}
 			start := int(idx.offsets[ci])
 			count := int(idx.counts[ci])
 			maxD := nh.maxD()

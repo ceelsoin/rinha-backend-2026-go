@@ -1,2 +1,20 @@
+IMAGE := ceelsoinacio/rinha-backend-2026:latest
+
+build:
+	docker build -t $(IMAGE) .
+
+push:
+	docker buildx build --platform linux/amd64 --push -t $(IMAGE) .
+
+up:
+	docker compose up -d
+
+down:
+	docker compose down -v
+
 test:
-	bash -c "cd test && docker compose --profile test up --abort-on-container-exit" 2>&1
+	docker compose -f test/docker-compose.yml --profile test up --abort-on-container-exit
+
+result:
+	cat test/test/results.json | jq -r '.scoring.raw' 
+.PHONY: build push up down test result
