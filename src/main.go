@@ -492,12 +492,29 @@ func (idx *HIVFIndex) scoreRequest(q *[stride]int16) float32 {
 	if probeEnd > l2Count {
 		probeEnd = l2Count
 	}
+	var d4 [4]int32
 	for pi := 0; pi < probeEnd; pi++ {
 		l2i := int(l2Buf[pi].i)
 		start := int(idx.offsets[l2i])
 		end := int(idx.offsets[l2i+1])
 		maxD := nh.maxD()
-		for vi := start; vi < end; vi++ {
+		vi := start
+		// 4-wide AVX2 loop with software prefetch ~24 records ahead.
+		for vi+3 < end {
+			if ahead := vi + 24; ahead < end {
+				prefetchVec(&idx.vecs[ahead*stride])
+			}
+			dist4(q, &idx.vecs[vi*stride], &d4)
+			for j := 0; j < 4; j++ {
+				if d := d4[j]; d < maxD {
+					nh.insert(d, idx.labels[vi+j])
+					maxD = nh.maxD()
+				}
+			}
+			vi += 4
+		}
+		// Scalar remainder (0–3 vectors).
+		for ; vi < end; vi++ {
 			v := (*[stride]int16)(unsafe.Pointer(&idx.vecs[vi*stride]))
 			if d := sqDist16(q, v); d < maxD {
 				nh.insert(d, idx.labels[vi])
@@ -514,7 +531,21 @@ func (idx *HIVFIndex) scoreRequest(q *[stride]int16) float32 {
 			start := int(idx.offsets[l2i])
 			end := int(idx.offsets[l2i+1])
 			maxD := nh.maxD()
-			for vi := start; vi < end; vi++ {
+			vi := start
+			for vi+3 < end {
+				if ahead := vi + 24; ahead < end {
+					prefetchVec(&idx.vecs[ahead*stride])
+				}
+				dist4(q, &idx.vecs[vi*stride], &d4)
+				for j := 0; j < 4; j++ {
+					if d := d4[j]; d < maxD {
+						nh.insert(d, idx.labels[vi+j])
+						maxD = nh.maxD()
+					}
+				}
+				vi += 4
+			}
+			for ; vi < end; vi++ {
 				v := (*[stride]int16)(unsafe.Pointer(&idx.vecs[vi*stride]))
 				if d := sqDist16(q, v); d < maxD {
 					nh.insert(d, idx.labels[vi])
@@ -1477,6 +1508,13 @@ func cmdServe(args []string) {
 	// Fault all 84MB of quantized vectors into RAM before accepting connections.
 	// Prevents OS page-fault latency spikes on first requests.
 	preWarmIndex(globalIdx)
+
+	// Lock all current pages in RAM so the OS cannot evict them under memory
+	// pressure. Eliminates page-fault latency spikes during sustained load.
+	// Requires memlock ulimit ≥ RSS (set to -1/unlimited in docker-compose).
+	if err := syscall.Mlockall(syscall.MCL_CURRENT); err != nil {
+		log.Printf("[serve] mlockall: %v (non-fatal, latency may vary)", err)
+	}
 
 	srv := &fasthttp.Server{
 		Handler:                       requestHandler,

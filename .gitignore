@@ -3,3 +3,5 @@ src/go
 *.log
 test/test/results.json
 top1/
+top1-new/
+top1-new2/
