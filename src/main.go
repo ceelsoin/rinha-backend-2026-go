@@ -39,14 +39,14 @@ const (
 	l1K          = 256  // HIVF level-1 cluster count
 	l2KPerL1     = 256  // HIVF level-2 clusters per L1 cluster
 	l2KTotal     = l1K * l2KPerL1 // 65,536 total L2 clusters
-	nProbeL1     = 16   // top L1 clusters to probe per query
-	nProbeL2     = 256  // top L2 clusters to probe (initial pass)
-	nProbeL2Ext  = 512  // extended probe when score is uncertain
+	nProbeL1     = 8    // top L1 clusters to probe per query (reduced for speed)
+	nProbeL2     = 128  // top L2 clusters to probe initial pass (reduced for speed)
+	nProbeL2Ext  = 256  // extended probe when score is uncertain (reduced for speed)
 	nNeigh       = 5    // k-NN neighbors — spec: k=5, fraud_score = frauds/5, approved < 0.6
 	fraudThresh  = float32(0.60) // spec threshold: approve if fraud_score < 0.6
 	confLow      = float32(0.38) // adaptive probe: extend when score ≥ confLow (catches 2/5=0.40)
 	confHigh     = float32(0.62) // adaptive probe: extend when score ≤ confHigh (catches 3/5=0.60)
-	nProbeRepair = 48   // centHeap backing-array size (L1 uses n=nProbeL1≤48)
+	nProbeRepair = 24   // centHeap backing-array size (L1 uses n=nProbeL1≤24)
 	trainSample  = 50000
 	trainItersL1 = 30
 	trainItersL2 = 20
@@ -1658,7 +1658,7 @@ func cmdServe(args []string) {
 		DisableHeaderNamesNormalizing: true,
 		MaxConnsPerIP:                 0,
 		Concurrency:                   4096,
-		ReadBufferSize:                512,
+		ReadBufferSize:                4096,
 		WriteBufferSize:               256,
 		ReadTimeout:                   5000000000,
 		WriteTimeout:                  5000000000,
