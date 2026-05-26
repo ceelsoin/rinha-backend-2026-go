@@ -22,6 +22,10 @@ import (
 	"syscall"
 )
 
+// SO_REUSEPORT is not exported by syscall on all Go/Linux builds;
+// hardcode the Linux value (0xf = 15) which is stable across all archs.
+const soReusePort = 0xf
+
 func main() {
 	log.SetFlags(log.Ltime | log.Lmsgprefix)
 
@@ -50,7 +54,7 @@ func main() {
 	if err := syscall.SetsockoptInt(listenFd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
 		log.Fatalf("[lb] SO_REUSEADDR: %v", err)
 	}
-	if err := syscall.SetsockoptInt(listenFd, syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1); err != nil {
+	if err := syscall.SetsockoptInt(listenFd, syscall.SOL_SOCKET, soReusePort, 1); err != nil {
 		log.Fatalf("[lb] SO_REUSEPORT: %v", err)
 	}
 	sa := &syscall.SockaddrInet4{Port: 9999}
