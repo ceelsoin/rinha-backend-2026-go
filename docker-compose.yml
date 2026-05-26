@@ -44,7 +44,7 @@ services:
     ports:
       - "9999:9999"
     environment:
-      - UPSTREAMS=/sockets/api1.sock,/sockets/api2.sock
+      - UPSTREAMS=/sockets/api1.sock,/sockets/api2.sock,/sockets/api1.sock,/sockets/api2.sock,/sockets/api1.sock,/sockets/api2.sock,/sockets/api1.sock,/sockets/api2.sock
     deploy:
       resources:
         limits:

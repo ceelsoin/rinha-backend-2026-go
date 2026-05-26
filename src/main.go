@@ -1173,12 +1173,112 @@ func loadMCCRisk(path string) (map[string]float32, error) {
 
 var parserPool fastjson.ParserPool
 
+// jsonCT is the Content-Type header value reused across all JSON responses.
+var jsonCT = []byte("application/json")
+
 // Server state (read-only after startup).
 var (
 	globalIdx     *HIVFIndex
 	globalMCCRisk map[string]float32
 	globalNorm    NormConfig
 )
+
+// isSafeMCC reports whether an MCC code is associated with low fraud risk.
+// Used in the obviously-legitimate fast-path.
+func isSafeMCC(mcc []byte) bool {
+	switch string(mcc) {
+	case "5411", // grocery stores
+		"5812", // restaurants / eating places
+		"5912", // drugstores / pharmacies
+		"5311": // department stores
+		return true
+	}
+	return false
+}
+
+// isRiskyMCC reports whether an MCC code is associated with high fraud risk.
+// Used in the obviously-fraudulent fast-path.
+func isRiskyMCC(mcc []byte) bool {
+	switch string(mcc) {
+	case "7995", // gambling / betting
+		"7801", // gambling establishments
+		"7802": // gambling, horse racing
+		return true
+	}
+	return false
+}
+
+// extractNestedFloat scans raw JSON bytes for objectKey → fieldKey: <number>.
+// Returns (value, true) or (0, false) if not found. Zero-allocation, no regexp.
+func extractNestedFloat(body, objectKey, fieldKey []byte) (float64, bool) {
+	pos := bytes.Index(body, objectKey)
+	if pos < 0 {
+		return 0, false
+	}
+	pos += len(objectKey)
+	rel := bytes.Index(body[pos:], fieldKey)
+	if rel < 0 {
+		return 0, false
+	}
+	pos += rel + len(fieldKey)
+	for pos < len(body) && body[pos] != ':' {
+		pos++
+	}
+	pos++ // skip ':'
+	for pos < len(body) && (body[pos] == ' ' || body[pos] == '\t' || body[pos] == '\r' || body[pos] == '\n') {
+		pos++
+	}
+	if pos >= len(body) {
+		return 0, false
+	}
+	neg := false
+	if body[pos] == '-' {
+		neg = true
+		pos++
+	}
+	if pos >= len(body) || body[pos] < '0' || body[pos] > '9' {
+		return 0, false
+	}
+	var v float64
+	for pos < len(body) && body[pos] >= '0' && body[pos] <= '9' {
+		v = v*10 + float64(body[pos]-'0')
+		pos++
+	}
+	if pos < len(body) && body[pos] == '.' {
+		pos++
+		scale := 0.1
+		for pos < len(body) && body[pos] >= '0' && body[pos] <= '9' {
+			v += float64(body[pos]-'0') * scale
+			scale *= 0.1
+			pos++
+		}
+	}
+	if neg {
+		return -v, true
+	}
+	return v, true
+}
+
+// scoreRatioFallback extracts only amount and customer avg_amount from raw JSON bytes
+// and returns a fraud decision based on the amount-to-average ratio.
+// Used when full JSON parsing fails completely.
+func scoreRatioFallback(body []byte, norm NormConfig) (approved bool, bucket int, ok bool) {
+	amount, ok1 := extractNestedFloat(body, []byte(`"transaction"`), []byte(`"amount"`))
+	if !ok1 {
+		return false, 0, false
+	}
+	avg, _ := extractNestedFloat(body, []byte(`"customer"`), []byte(`"avg_amount"`))
+	if avg <= 0 {
+		avg = 1
+	}
+	ratio := clamp32(float32(amount/avg) * norm.InvAmountVsAvgRatio)
+	approved = ratio < fraudThresh
+	bucket = int(ratio*100 + 0.5)
+	if bucket > 100 {
+		bucket = 100
+	}
+	return approved, bucket, true
+}
 
 func handleReady(ctx *fasthttp.RequestCtx) {
 	ctx.SetStatusCode(fasthttp.StatusOK)
@@ -1191,6 +1291,16 @@ func handleFraudScore(ctx *fasthttp.RequestCtx) {
 
 	v, err := p.ParseBytes(ctx.PostBody())
 	if err != nil {
+		// Ratio fallback: parse only amount + avg_amount for a quick decision.
+		if approved, bucket, ok := scoreRatioFallback(ctx.PostBody(), globalNorm); ok {
+			ctx.SetContentTypeBytes(jsonCT)
+			if approved {
+				ctx.SetBody(approvedResponses[bucket])
+			} else {
+				ctx.SetBody(deniedResponses[bucket])
+			}
+			return
+		}
 		ctx.SetStatusCode(fasthttp.StatusBadRequest)
 		return
 	}
@@ -1224,6 +1334,36 @@ func handleFraudScore(ctx *fasthttp.RequestCtx) {
 	kmFromHome := float32(term.GetFloat64("km_from_home"))
 
 	lastTx := v.Get("last_transaction")
+
+	// ── Compute known early (reused in fast-paths and vectorization) ──────────
+	known := false
+	for _, km := range knownMerchants {
+		if bytes.Equal(km.GetStringBytes(), merchantID) {
+			known = true
+			break
+		}
+	}
+
+	// ── Fast-path: obviously legitimate (ALL conditions must hold) ────────────
+	// Small amount below half the customer average, few installments, low
+	// recent-tx velocity, known merchant, near home, safe MCC category.
+	if amount <= 500 && avgAmount > 0 && (amount/avgAmount) <= 0.5 &&
+		installments <= 3 && txCount24h <= 5 && known &&
+		kmFromHome <= 50 && isSafeMCC(mccBytes) {
+		ctx.SetContentTypeBytes(jsonCT)
+		ctx.SetBody(approvedResponses[0])
+		return
+	}
+
+	// ── Fast-path: obviously fraudulent (ALL conditions must hold) ────────────
+	// Large amount, many installments, high velocity, unknown merchant,
+	// far from home, and in a high-risk MCC category.
+	if amount >= 5000 && installments >= 5 && txCount24h >= 6 &&
+		!known && kmFromHome >= 150 && isRiskyMCC(mccBytes) {
+		ctx.SetContentTypeBytes(jsonCT)
+		ctx.SetBody(deniedResponses[100])
+		return
+	}
 
 	// ── Normalize → 14-dim float32 vector ────────────────────────────────────
 	cfg := globalNorm
@@ -1275,14 +1415,7 @@ func handleFraudScore(ctx *fasthttp.RequestCtx) {
 		vec[10] = 1.0
 	}
 
-	// 11. unknown_merchant (1 = unknown, 0 = known)
-	known := false
-	for _, km := range knownMerchants {
-		if bytes.Equal(km.GetStringBytes(), merchantID) {
-			known = true
-			break
-		}
-	}
+	// 11. unknown_merchant (1 = unknown, 0 = known) — computed above for fast-paths
 	if !known {
 		vec[11] = 1.0
 	}
@@ -1297,13 +1430,26 @@ func handleFraudScore(ctx *fasthttp.RequestCtx) {
 	// 13. merchant avg_amount / max_merchant_avg_amount
 	vec[13] = clamp32(merchantAvg * cfg.InvMaxMerchantAvgAmount)
 
+	// ── Decision tree (primary classifier) ───────────────────────────────────
+	// If the tree is confident (leaf purity >= treeConfidenceThreshold), return
+	// immediately without the expensive HIVF k-NN search.
+	if treeFraud, treeConfident := treePredict(&vec); treeConfident {
+		ctx.SetContentTypeBytes(jsonCT)
+		if treeFraud {
+			ctx.SetBody(deniedResponses[100])
+		} else {
+			ctx.SetBody(approvedResponses[0])
+		}
+		return
+	}
+
 	// ── Quantize to int16 (with feature weights baked in) ────────────────────
 	var q [stride]int16 // last 2 elements stay 0 (SIMD padding)
 	for i, fv := range vec {
 		q[i] = quantizeF32(fv * featureWeights[i])
 	}
 
-	// ── HIVF search ──────────────────────────────────────────────────────────
+	// ── HIVF search (fallback for uncertain tree cases) ───────────────────────
 	score := globalIdx.scoreRequest(&q)
 
 	// ── Return pre-computed response ─────────────────────────────────────────
@@ -1312,7 +1458,7 @@ func handleFraudScore(ctx *fasthttp.RequestCtx) {
 	if bucket > 100 {
 		bucket = 100
 	}
-	ctx.SetContentTypeBytes([]byte("application/json"))
+	ctx.SetContentTypeBytes(jsonCT)
 	if approved {
 		ctx.SetBody(approvedResponses[bucket])
 	} else {
