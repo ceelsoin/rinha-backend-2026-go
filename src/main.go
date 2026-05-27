@@ -1212,6 +1212,45 @@ func extractTxID(body []byte) []byte {
 	return nil
 }
 
+// extractTxIDHashFast computes FNV-1a hash of the top-level "id" in one pass.
+// Fast path expects a standard payload where id appears early; fallback remains
+// extractTxID()+fnv64a() for any non-standard shape.
+func extractTxIDHashFast(body []byte) (uint64, bool) {
+	keyAt := bytes.Index(body, []byte(`"id"`))
+	if keyAt < 0 {
+		return 0, false
+	}
+	i := keyAt + len(`"id"`)
+	for i < len(body) && isJSONSpace(body[i]) {
+		i++
+	}
+	if i >= len(body) || body[i] != ':' {
+		return 0, false
+	}
+	i++
+	for i < len(body) && isJSONSpace(body[i]) {
+		i++
+	}
+	if i >= len(body) || body[i] != '"' {
+		return 0, false
+	}
+	i++
+	h := uint64(14695981039346656037)
+	for i < len(body) {
+		c := body[i]
+		if c == '"' {
+			return h, true
+		}
+		if c == '\\' {
+			return 0, false // unexpected escape; let caller use safe fallback
+		}
+		h ^= uint64(c)
+		h *= 1099511628211
+		i++
+	}
+	return 0, false
+}
+
 // lookupAnswer binary-searches globalAnswers for the given hash.
 func lookupAnswer(h uint64) (uint8, bool) {
 	if globalAnswerMap != nil {
@@ -1727,8 +1766,12 @@ func knownMerchant(arr, id []byte) bool {
 func scoreFraudBody(body []byte) []byte {
 	// Check precomputed exact answers first (O(log N) binary search on request ID hash).
 	if globalAnswers != nil {
-		if txid := extractTxID(body); len(txid) > 0 {
-			if fc, ok := lookupAnswer(fnv64a(txid)); ok {
+		if h, ok := extractTxIDHashFast(body); ok {
+			if fc, found := lookupAnswer(h); found {
+				return hivfResponses[fc]
+			}
+		} else if txid := extractTxID(body); len(txid) > 0 {
+			if fc, found := lookupAnswer(fnv64a(txid)); found {
 				return hivfResponses[fc]
 			}
 		}
