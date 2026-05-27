@@ -2160,21 +2160,14 @@ func cmdServe(args []string) {
 	}
 
 	if socketPath != "" {
-		// UNIX stream mode: nginx connects to us via this socket.
+		// FD-passing mode: LB sends accepted TCP client fds via SCM_RIGHTS.
 		os.Remove(socketPath) // clean up leftover from previous run
-		ln, err := net.Listen("unix", socketPath)
+		udsFd, err := bindDGRAMSocket(socketPath)
 		if err != nil {
-			log.Fatalf("listen unix %s: %v", socketPath, err)
+			log.Fatalf("bind unix-dgram %s: %v", socketPath, err)
 		}
-		os.Chmod(socketPath, 0777) //nolint: nginx must be able to connect
-		log.Printf("[serve] listening on unix-stream:%s", socketPath)
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				continue
-			}
-			go handleConn(conn)
-		}
+		log.Printf("[serve] listening on unix-dgram:%s (fd-passing)", socketPath)
+		recvFDLoop(udsFd)
 	} else {
 		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
 		if err != nil {

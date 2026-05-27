@@ -33,13 +33,13 @@ services:
       - SOCKET_PATH=/sockets/api2.sock
 
   lb:
-    image: nginx:1.27-alpine
+    image: ${RINHA_IMAGE:-ceelsoinacio/rinha-backend-2026:v10}
     container_name: rinha_lb
     depends_on:
       - api1
       - api2
+    command: ["./lb"]
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - sockets:/sockets
     ports:
       - "9999:9999"
