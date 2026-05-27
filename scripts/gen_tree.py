@@ -173,14 +173,14 @@ def main() -> None:
     from sklearn.tree import DecisionTreeClassifier
 
     clf = DecisionTreeClassifier(
-        max_depth=15,
-        min_samples_leaf=20,
+        max_depth=None,        # unlimited: let the tree grow until min_samples_leaf
+        min_samples_leaf=3,    # ~3x finer than before → captures boundary better
         min_impurity_decrease=0,
         random_state=42,
         class_weight="balanced",
     )
     print(
-        "[gen_tree] training DecisionTreeClassifier(max_depth=15, min_samples_leaf=20) ...",
+        "[gen_tree] training DecisionTreeClassifier(max_depth=None, min_samples_leaf=3) ...",
         flush=True,
     )
     clf.fit(X, y)

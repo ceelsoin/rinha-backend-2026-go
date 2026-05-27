@@ -121,8 +121,10 @@ func main() {
 
 		// Send fd to the chosen API worker via SCM_RIGHTS.
 		// Retry a few times to handle transient ENOBUFS or late socket binding.
+		// On persistent failure, just close — the LB must not send any response
+		// before passing the connection (per competition rules: LB applies no logic).
 		if err := sendFd(udsFd, path, clientFd); err != nil {
-			send503(clientFd)
+			log.Printf("[lb] sendFd failed: %v", err)
 		}
 
 		// LB closes its copy — the worker received a dup'd fd from the kernel.

@@ -1,5 +1,5 @@
 x-api: &api-common
-  image: ${RINHA_IMAGE:-ceelsoinacio/rinha-backend-2026:v6}
+  image: ${RINHA_IMAGE:-ceelsoinacio/rinha-backend-2026:v7}
   volumes:
     - sockets:/sockets
   deploy:
@@ -33,7 +33,7 @@ services:
       - SOCKET_PATH=/sockets/api2.sock
 
   lb:
-    image: ${RINHA_IMAGE:-ceelsoinacio/rinha-backend-2026:v6}
+    image: ${RINHA_IMAGE:-ceelsoinacio/rinha-backend-2026:v7}
     container_name: rinha_lb
     command: ["./lb"]
     depends_on:
