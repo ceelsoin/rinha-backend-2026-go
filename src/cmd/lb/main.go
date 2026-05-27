@@ -20,6 +20,7 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // SO_REUSEPORT is not exported by syscall on all Go/Linux builds;
@@ -74,6 +75,31 @@ func main() {
 	// Large send buffer so bursts don't block even if an API is momentarily slow.
 	syscall.SetsockoptInt(udsFd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 16*1024*1024) //nolint
 
+	// ── Wait for all upstream sockets to be ready (up to 10 s) ──────────────
+	// The API containers may take a moment to bind their UNIX sockets after
+	// the LB container starts (depends_on only waits for container start, not
+	// application readiness). Accepting connections before the sockets exist
+	// causes sendFd to fail with ENOENT → spurious 503 responses.
+	seen := make(map[string]bool, len(upstreams))
+	deadline := time.Now().Add(10 * time.Second)
+	for len(seen) < len(upstreams) && time.Now().Before(deadline) {
+		for _, path := range upstreams {
+			if seen[path] {
+				continue
+			}
+			if _, err := os.Stat(path); err == nil {
+				seen[path] = true
+				log.Printf("[lb] upstream ready: %s", path)
+			}
+		}
+		if len(seen) < len(upstreams) {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if len(seen) < len(upstreams) {
+		log.Printf("[lb] warning: not all upstream sockets appeared within 10s")
+	}
+
 	log.Printf("[lb] listening on :9999, upstreams=%v", upstreams)
 
 	nUp := uint64(len(upstreams))
@@ -94,6 +120,7 @@ func main() {
 		rr++
 
 		// Send fd to the chosen API worker via SCM_RIGHTS.
+		// Retry a few times to handle transient ENOBUFS or late socket binding.
 		if err := sendFd(udsFd, path, clientFd); err != nil {
 			send503(clientFd)
 		}
@@ -104,12 +131,19 @@ func main() {
 }
 
 // sendFd passes clientFd to the Unix DGRAM socket at path using SCM_RIGHTS.
-// The kernel duplicates the fd into the receiving process's fd table.
+// Retries up to 5 times with 1 ms backoff before giving up.
 func sendFd(udsFd int, path string, clientFd int) error {
 	rights := syscall.UnixRights(clientFd)
 	dummy := []byte{1} // non-empty iov required by sendmsg
 	addr := &syscall.SockaddrUnix{Name: path}
-	return syscall.Sendmsg(udsFd, dummy, rights, addr, syscall.MSG_NOSIGNAL)
+	var err error
+	for i := 0; i < 5; i++ {
+		if err = syscall.Sendmsg(udsFd, dummy, rights, addr, syscall.MSG_NOSIGNAL); err == nil {
+			return nil
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+	return err
 }
 
 const resp503 = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -117,3 +151,4 @@ const resp503 = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnec
 func send503(fd int) {
 	syscall.Write(fd, []byte(resp503)) //nolint
 }
+

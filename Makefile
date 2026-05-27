@@ -1,4 +1,5 @@
-IMAGE := ceelsoinacio/rinha-backend-2026:v5
+IMAGE      := ceelsoinacio/rinha-backend-2026:v6
+LOCAL_IMAGE := rinha-local:latest
 
 build:
 	docker build -t $(IMAGE) .
@@ -12,9 +13,24 @@ up:
 down:
 	docker compose down -v
 
+# ── Local (native arm64 on Mac) ───────────────────────────────────────────────
+local-build:
+	docker build -t $(LOCAL_IMAGE) .
+
+local-up: local-build
+	RINHA_IMAGE=$(LOCAL_IMAGE) docker compose up -d
+
+local-down:
+	RINHA_IMAGE=$(LOCAL_IMAGE) docker compose down -v
+
+local-test: local-build
+	RINHA_IMAGE=$(LOCAL_IMAGE) docker compose up -d
+	docker compose -f test/docker-compose.yml --profile test up --abort-on-container-exit
+	RINHA_IMAGE=$(LOCAL_IMAGE) docker compose down -v
+
 test:
 	docker compose -f test/docker-compose.yml --profile test up --abort-on-container-exit
 
 result:
 	cat test/test/results.json | jq -r '.scoring.raw' 
-.PHONY: build push up down test result
+.PHONY: build push up down local-build local-up local-down local-test test result
