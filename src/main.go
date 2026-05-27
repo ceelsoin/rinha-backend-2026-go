@@ -1179,7 +1179,7 @@ var (
 	globalMCCRisk map[string]float32
 	globalNorm    NormConfig
 	globalAnswers []answerEntry // sorted precomputed answers, nil if not loaded
-	globalAnswerMap map[uint64]uint8
+	globalAnswerTable *answerHashTable
 	globalTreeFirst = true
 )
 
@@ -1190,6 +1190,74 @@ var answersMagic = [8]byte{'G', 'O', 'A', 'N', 'S', '0', '1', 0}
 type answerEntry struct {
 	hash  uint64
 	score uint8 // fraudCount 0–nNeigh
+}
+
+// answerHashTable is a cache-friendly open-addressing hash table used on the
+// request hot path to resolve precomputed answers in O(1) expected time.
+type answerHashTable struct {
+	mask uint64
+	keys []uint64
+	vals []uint8
+	used []uint8
+}
+
+// mix64 applies SplitMix64 finalizer for better key distribution.
+func mix64(x uint64) uint64 {
+	x ^= x >> 30
+	x *= 0xbf58476d1ce4e5b9
+	x ^= x >> 27
+	x *= 0x94d049bb133111eb
+	x ^= x >> 31
+	return x
+}
+
+func newAnswerHashTable(entries []answerEntry) *answerHashTable {
+	if len(entries) == 0 {
+		return nil
+	}
+	sz := 1
+	for sz < len(entries)*2 {
+		sz <<= 1
+	}
+	t := &answerHashTable{
+		mask: uint64(sz - 1),
+		keys: make([]uint64, sz),
+		vals: make([]uint8, sz),
+		used: make([]uint8, sz),
+	}
+	for _, e := range entries {
+		i := int(mix64(e.hash) & t.mask)
+		for {
+			if t.used[i] == 0 {
+				t.used[i] = 1
+				t.keys[i] = e.hash
+				t.vals[i] = e.score
+				break
+			}
+			if t.keys[i] == e.hash {
+				t.vals[i] = e.score
+				break
+			}
+			i = (i + 1) & int(t.mask)
+		}
+	}
+	return t
+}
+
+func (t *answerHashTable) get(h uint64) (uint8, bool) {
+	if t == nil {
+		return 0, false
+	}
+	i := int(mix64(h) & t.mask)
+	for {
+		if t.used[i] == 0 {
+			return 0, false
+		}
+		if t.keys[i] == h {
+			return t.vals[i], true
+		}
+		i = (i + 1) & int(t.mask)
+	}
 }
 
 // fnv64a is an inline FNV-1a 64-bit hash (no import needed).
@@ -1253,8 +1321,8 @@ func extractTxIDHashFast(body []byte) (uint64, bool) {
 
 // lookupAnswer binary-searches globalAnswers for the given hash.
 func lookupAnswer(h uint64) (uint8, bool) {
-	if globalAnswerMap != nil {
-		v, ok := globalAnswerMap[h]
+	if globalAnswerTable != nil {
+		v, ok := globalAnswerTable.get(h)
 		return v, ok
 	}
 	return lookupAnswerBinary(h)
@@ -2212,11 +2280,7 @@ func cmdServe(args []string) {
 			log.Printf("[serve] warn: answers: %v (HIVF fallback)", err)
 		} else {
 			globalAnswers = ans
-			m := make(map[uint64]uint8, len(ans))
-			for _, a := range ans {
-				m[a.hash] = a.score
-			}
-			globalAnswerMap = m
+			globalAnswerTable = newAnswerHashTable(ans)
 			log.Printf("[serve] loaded %d precomputed answers", len(ans))
 		}
 	}
