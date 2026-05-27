@@ -39,6 +39,8 @@ services:
       - api1
       - api2
     command: ["./lb"]
+    environment:
+      - UPSTREAMS=${LB_UPSTREAMS:-/sockets/api1.sock,/sockets/api2.sock,/sockets/api1.sock,/sockets/api2.sock,/sockets/api1.sock,/sockets/api2.sock,/sockets/api1.sock,/sockets/api2.sock}
     volumes:
       - sockets:/sockets
     ports:

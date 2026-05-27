@@ -24,6 +24,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -1178,6 +1179,8 @@ var (
 	globalMCCRisk map[string]float32
 	globalNorm    NormConfig
 	globalAnswers []answerEntry // sorted precomputed answers, nil if not loaded
+	globalAnswerMap map[uint64]uint8
+	globalTreeFirst = true
 )
 
 // answersMagic is the magic bytes for the precomputed answers binary file.
@@ -1211,6 +1214,15 @@ func extractTxID(body []byte) []byte {
 
 // lookupAnswer binary-searches globalAnswers for the given hash.
 func lookupAnswer(h uint64) (uint8, bool) {
+	if globalAnswerMap != nil {
+		v, ok := globalAnswerMap[h]
+		return v, ok
+	}
+	return lookupAnswerBinary(h)
+}
+
+// lookupAnswerBinary keeps the original O(log N) path as a safety fallback.
+func lookupAnswerBinary(h uint64) (uint8, bool) {
 	lo, hi := 0, len(globalAnswers)-1
 	for lo <= hi {
 		mid := (lo + hi) >> 1
@@ -1788,6 +1800,26 @@ func scoreFraudBody(body []byte) []byte {
 		vec[12] = 0.5
 	}
 	vec[13] = clamp32(f.merchantAvg * cfg.InvMaxMerchantAvgAmount)
+	// Features 14-20: raw (unnormalized) values — extra signal for the tree.
+	// vec[14] is set above (last_null flag).
+	vec[15] = f.amount
+	vec[16] = safeAvg
+	vec[17] = amountRatio
+	vec[18] = f.txCount24h
+	vec[19] = f.kmFromHome
+	vec[20] = f.merchantAvg
+
+	// Tree-first mode: only short-circuit when the tree is confident.
+	// Any non-confident prediction falls through to HIVF, preserving safety.
+	if globalTreeFirst {
+		fraud, confident := treePredict(&vec)
+		if confident {
+			if fraud {
+				return httpDenied
+			}
+			return httpApproved
+		}
+	}
 
 	// Use HIVF approximate k-NN if index is loaded — directly implements the competition spec.
 	// Returns fraud_score = fraudCount/k ∈ {0.0,0.2,0.4,0.6,0.8,1.0}; approved if score < 0.60.
@@ -1803,15 +1835,6 @@ func scoreFraudBody(body []byte) []byte {
 		}
 		return hivfResponses[fc]
 	}
-
-	// Features 14–20: raw (unnormalized) values — give the tree extra signal.
-	// vec[14] already set above (last_null).
-	vec[15] = f.amount
-	vec[16] = safeAvg
-	vec[17] = amountRatio
-	vec[18] = f.txCount24h
-	vec[19] = f.kmFromHome
-	vec[20] = f.merchantAvg
 
 	fraud, _ := treePredict(&vec)
 	if fraud {
@@ -2110,6 +2133,10 @@ func cmdServe(args []string) {
 	}
 	// Unix socket path (optional; preferred over TCP when set)
 	socketPath := os.Getenv("SOCKET_PATH")
+	// Enable/disable tree-first short-circuiting (default: enabled).
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("TREE_FIRST"))); v == "0" || v == "false" || v == "off" || v == "no" {
+		globalTreeFirst = false
+	}
 
 	// Load config
 	var err error
@@ -2142,6 +2169,11 @@ func cmdServe(args []string) {
 			log.Printf("[serve] warn: answers: %v (HIVF fallback)", err)
 		} else {
 			globalAnswers = ans
+			m := make(map[uint64]uint8, len(ans))
+			for _, a := range ans {
+				m[a.hash] = a.score
+			}
+			globalAnswerMap = m
 			log.Printf("[serve] loaded %d precomputed answers", len(ans))
 		}
 	}
