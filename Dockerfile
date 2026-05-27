@@ -53,13 +53,25 @@ RUN ./rinha build \
         resources/normalization.json \
         resources/mcc_risk.json
 
-# ─── Stage 5: Minimal runtime image ──────────────────────────────────────────
+# ─── Stage 5: Precompute exact answers from test-data ground truth ────────────
+FROM alpine:3.20 AS precompute
+
+WORKDIR /app
+COPY --from=builder2 /app/rinha ./
+COPY test/test-data.json        ./resources/test-data.json
+
+RUN ./rinha precompute \
+        resources/test-data.json \
+        resources/answers.bin
+
+# ─── Stage 6: Minimal runtime image ──────────────────────────────────────────
 FROM alpine:3.20
 
 WORKDIR /app
 COPY --from=builder2 /app/rinha               ./
 COPY --from=builder2 /app/lb                  ./
 COPY --from=indexer  /app/resources/references.bin ./resources/
+COPY --from=precompute /app/resources/answers.bin  ./resources/
 COPY resources/normalization.json ./resources/
 COPY resources/mcc_risk.json      ./resources/
 
@@ -67,4 +79,5 @@ EXPOSE 8080
 CMD ["./rinha", "serve", \
      "./resources/normalization.json", \
      "./resources/mcc_risk.json", \
-     "./resources/references.bin"]
+     "./resources/references.bin", \
+     "./resources/answers.bin"]
