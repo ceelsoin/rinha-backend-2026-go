@@ -38,16 +38,33 @@ RUN CGO_ENABLED=0 \
     go build -ldflags="-s -w" -o rinha . && \
     go build -ldflags="-s -w" -o lb ./cmd/lb
 
-# ─── Stage 4: Minimal runtime image ──────────────────────────────────────────
+# ─── Stage 4: Build HIVF k-NN index from reference vectors ───────────────────
+FROM alpine:3.20 AS indexer
+
+WORKDIR /app
+COPY --from=builder2 /app/rinha            ./
+COPY resources/references.json.gz          ./resources/
+COPY resources/normalization.json          ./resources/
+COPY resources/mcc_risk.json               ./resources/
+
+RUN ./rinha build \
+        resources/references.json.gz \
+        resources/references.bin \
+        resources/normalization.json \
+        resources/mcc_risk.json
+
+# ─── Stage 5: Minimal runtime image ──────────────────────────────────────────
 FROM alpine:3.20
 
 WORKDIR /app
 COPY --from=builder2 /app/rinha               ./
 COPY --from=builder2 /app/lb                  ./
+COPY --from=indexer  /app/resources/references.bin ./resources/
 COPY resources/normalization.json ./resources/
 COPY resources/mcc_risk.json      ./resources/
 
 EXPOSE 8080
 CMD ["./rinha", "serve", \
      "./resources/normalization.json", \
-     "./resources/mcc_risk.json"]
+     "./resources/mcc_risk.json", \
+     "./resources/references.bin"]

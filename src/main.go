@@ -79,6 +79,18 @@ var (
 	httpNotFound = []byte("HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: 22\r\n\r\n{\"error\":\"not_found\"}\n")
 )
 
+// hivfResponses holds pre-built HTTP/1.1 responses for all 6 possible HIVF fraud scores.
+// k=5 neighbours → fraudCount ∈ {0,1,2,3,4,5} → fraud_score ∈ {0.0,0.2,0.4,0.6,0.8,1.0}.
+// Index by fraudCount: approved if fraudCount < 3 (score < 0.60 per spec).
+var hivfResponses = [6][]byte{
+	[]byte("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 36\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}\n"),
+	[]byte("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 36\r\n\r\n{\"approved\":true,\"fraud_score\":0.2}\n"),
+	[]byte("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 36\r\n\r\n{\"approved\":true,\"fraud_score\":0.4}\n"),
+	[]byte("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 37\r\n\r\n{\"approved\":false,\"fraud_score\":0.6}\n"),
+	[]byte("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 37\r\n\r\n{\"approved\":false,\"fraud_score\":0.8}\n"),
+	[]byte("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 37\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}\n"),
+}
+
 // ── IVF Index ────────────────────────────────────────────────────────────────
 
 // HIVFIndex holds the 2-level hierarchical IVF index.
@@ -1661,6 +1673,21 @@ func scoreFraudBody(body []byte) []byte {
 	}
 	vec[13] = clamp32(f.merchantAvg * cfg.InvMaxMerchantAvgAmount)
 
+	// Use HIVF approximate k-NN if index is loaded — directly implements the competition spec.
+	// Returns fraud_score = fraudCount/k ∈ {0.0,0.2,0.4,0.6,0.8,1.0}; approved if score < 0.60.
+	if globalIdx != nil {
+		var q [stride]int16
+		for i := 0; i < dims; i++ {
+			q[i] = quantizeF32(vec[i] * featureWeights[i])
+		}
+		score := globalIdx.scoreRequest(&q)
+		fc := int(score*float32(nNeigh) + 0.5)
+		if fc > nNeigh {
+			fc = nNeigh
+		}
+		return hivfResponses[fc]
+	}
+
 	// Features 14–20: raw (unnormalized) values — give the tree extra signal.
 	// vec[14] already set above (last_null).
 	vec[15] = f.amount
@@ -1875,7 +1902,7 @@ func cmdServe(args []string) {
 
 	remaining := fs.Args()
 	if len(remaining) < 2 {
-		fmt.Fprintln(os.Stderr, "Usage: rinha serve <norm.json> <mcc.json> [flags]")
+		fmt.Fprintln(os.Stderr, "Usage: rinha serve <norm.json> <mcc.json> [<index.bin>] [flags]")
 		os.Exit(1)
 	}
 	normPath, mccPath := remaining[0], remaining[1]
@@ -1898,6 +1925,18 @@ func cmdServe(args []string) {
 		log.Fatalf("mcc risk: %v", err)
 	}
 
+	// Optionally load HIVF index (3rd positional arg).
+	if len(remaining) >= 3 {
+		idxPath := remaining[2]
+		log.Printf("[serve] loading HIVF index from %s...", idxPath)
+		idx, err := mmapIndex(idxPath)
+		if err != nil {
+			log.Fatalf("mmap index: %v", err)
+		}
+		globalIdx = idx
+		preWarmIndex(idx)
+	}
+
 	// Lock to 1 OS thread immediately — each container has exactly 1 CPU (cpuset).
 	runtime.GOMAXPROCS(1)
 
@@ -1912,16 +1951,21 @@ func cmdServe(args []string) {
 	}
 
 	if socketPath != "" {
-		// FD-passing mode: receive client fds from the Go LB via Unix DGRAM + SCM_RIGHTS.
-		log.Printf("[serve] FD-passing mode on unix-dgram:%s", socketPath)
+		// UNIX stream mode: nginx connects to us via this socket.
 		os.Remove(socketPath) // clean up leftover from previous run
-
-		udsFd, err := bindDGRAMSocket(socketPath)
+		ln, err := net.Listen("unix", socketPath)
 		if err != nil {
-			log.Fatalf("bind DGRAM socket %s: %v", socketPath, err)
+			log.Fatalf("listen unix %s: %v", socketPath, err)
 		}
-		log.Printf("[serve] ready, receiving fds from LB")
-		recvFDLoop(udsFd)
+		os.Chmod(socketPath, 0777) //nolint: nginx must be able to connect
+		log.Printf("[serve] listening on unix-stream:%s", socketPath)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				continue
+			}
+			go handleConn(conn)
+		}
 	} else {
 		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
 		if err != nil {
