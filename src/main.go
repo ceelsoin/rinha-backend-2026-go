@@ -11,6 +11,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
@@ -21,6 +22,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"sort"
@@ -33,23 +35,30 @@ import (
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const (
-	dims         = 14   // feature dimensions
-	stride       = 16   // storage stride per vector: padded to 16 int16 for SIMD alignment
-	l1K          = 256  // HIVF level-1 cluster count
-	l2KPerL1     = 256  // HIVF level-2 clusters per L1 cluster
+	dims         = 14             // feature dimensions
+	stride       = 16             // storage stride per vector: padded to 16 int16 for SIMD alignment
+	l1K          = 256            // HIVF level-1 cluster count
+	l2KPerL1     = 256            // HIVF level-2 clusters per L1 cluster
 	l2KTotal     = l1K * l2KPerL1 // 65,536 total L2 clusters
-	nProbeL1     = 16   // top L1 clusters to probe per query
-	nProbeL2     = 256  // top L2 clusters to probe (initial pass)
-	nProbeL2Ext  = 512  // extended probe when score is uncertain
-	nNeigh       = 5    // k-NN neighbors — spec: k=5, fraud_score = frauds/5, approved < 0.6
-	fraudThresh  = float32(0.60) // spec threshold: approve if fraud_score < 0.6
-	treeDims     = 21   // feature count for the decision tree (14 normalised + 7 raw extras)
-	confLow      = float32(0.38) // adaptive probe: extend when score ≥ confLow (catches 2/5=0.40)
-	confHigh     = float32(0.62) // adaptive probe: extend when score ≤ confHigh (catches 3/5=0.60)
-	nProbeRepair = 48   // centHeap backing-array size (L1 uses n=nProbeL1≤48)
+	nProbeL1     = 16             // top L1 clusters to probe per query
+	nProbeL2     = 256            // top L2 clusters to probe (initial pass)
+	nProbeL2Ext  = 512            // extended probe when score is uncertain
+	nNeigh       = 5              // k-NN neighbors — spec: k=5, fraud_score = frauds/5, approved < 0.6
+	fraudThresh  = float32(0.60)  // spec threshold: approve if fraud_score < 0.6
+	treeDims     = 21             // feature count for the decision tree (14 normalised + 7 raw extras)
+	confLow      = float32(0.38)  // adaptive probe: extend when score ≥ confLow (catches 2/5=0.40)
+	confHigh     = float32(0.62)  // adaptive probe: extend when score ≤ confHigh (catches 3/5=0.60)
+	nProbeRepair = 48             // centHeap backing-array size (L1 uses n=nProbeL1≤48)
 	trainSample  = 50000
 	trainItersL1 = 30
 	trainItersL2 = 20
+
+	soReusePort      = 0xf
+	soBusyPoll       = 0x2e
+	soPreferBusyPoll = 0x45
+	soBusyPollBudget = 0x46
+	tcpDeferAccept   = 0x9
+	tcpFastOpen      = 0x17
 )
 
 var hivfMagic = [8]byte{'G', 'O', 'H', 'I', 'V', 'F', '0', '2'} // HIVF v2: +feature weights
@@ -980,6 +989,65 @@ func readIndex(path string) (*HIVFIndex, error) {
 	}, nil
 }
 
+func partitionIndexPaths(outPath string) [4]string {
+	ext := filepath.Ext(outPath)
+	if ext == "" {
+		ext = ".bin"
+	}
+	base := strings.TrimSuffix(outPath, ext)
+	return [4]string{
+		fmt.Sprintf("%s_p0%s", base, ext),
+		fmt.Sprintf("%s_p1%s", base, ext),
+		fmt.Sprintf("%s_p2%s", base, ext),
+		fmt.Sprintf("%s_p3%s", base, ext),
+	}
+}
+
+func splitQuantizedByTag(vecs []int16, labels []uint8) ([4][]int16, [4][]uint8) {
+	var pVecs [4][]int16
+	var pLabels [4][]uint8
+	n := len(labels)
+	for i := 0; i < n; i++ {
+		off := i * dims
+		if off+dims > len(vecs) {
+			break
+		}
+		unknown := vecs[off+11] > 5000
+		hasLast := vecs[off+5] >= 0
+		tag := 0
+		if unknown {
+			tag |= 2
+		}
+		if hasLast {
+			tag |= 1
+		}
+		pVecs[tag] = append(pVecs[tag], vecs[off:off+dims]...)
+		pLabels[tag] = append(pLabels[tag], labels[i])
+	}
+	return pVecs, pLabels
+}
+
+func loadPartitionedIndexes(basePath string) ([4]*HIVFIndex, bool, error) {
+	var out [4]*HIVFIndex
+	paths := partitionIndexPaths(basePath)
+	for _, p := range paths {
+		if _, err := os.Stat(p); err != nil {
+			if os.IsNotExist(err) {
+				return out, false, nil
+			}
+			return out, false, err
+		}
+	}
+	for i, p := range paths {
+		idx, err := mmapIndex(p)
+		if err != nil {
+			return out, false, fmt.Errorf("mmap partition %d (%s): %w", i, p, err)
+		}
+		out[i] = idx
+	}
+	return out, true, nil
+}
+
 // mmapIndex maps references.bin directly into process memory without copying.
 // Both api1 and api2 containers share the same OS page cache for the file
 // (same read-only image layer → same inode → same physical pages), so the
@@ -1056,7 +1124,6 @@ func mmapIndex(path string) (*HIVFIndex, error) {
 		mapped:  mapped,
 	}, nil
 }
-
 
 // ── References loader ────────────────────────────────────────────────────────
 
@@ -1155,7 +1222,21 @@ func loadNormConfig(path string) (NormConfig, error) {
 	}, nil
 }
 
-func loadMCCRisk(path string) (map[string]float32, error) {
+func packMCCKey4(s string) (uint32, bool) {
+	if len(s) != 4 {
+		return 0, false
+	}
+	return uint32(s[0])<<24 | uint32(s[1])<<16 | uint32(s[2])<<8 | uint32(s[3]), true
+}
+
+func packMCCKeyBytes(s []byte) (uint32, bool) {
+	if len(s) != 4 {
+		return 0, false
+	}
+	return uint32(s[0])<<24 | uint32(s[1])<<16 | uint32(s[2])<<8 | uint32(s[3]), true
+}
+
+func loadMCCRisk(path string) (map[uint32]float32, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -1164,9 +1245,11 @@ func loadMCCRisk(path string) (map[string]float32, error) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, err
 	}
-	m := make(map[string]float32, len(raw))
+	m := make(map[uint32]float32, len(raw))
 	for k, v := range raw {
-		m[k] = float32(v)
+		if key, ok := packMCCKey4(k); ok {
+			m[key] = float32(v)
+		}
 	}
 	return m, nil
 }
@@ -1175,12 +1258,13 @@ func loadMCCRisk(path string) (map[string]float32, error) {
 
 // Server state (read-only after startup).
 var (
-	globalIdx     *HIVFIndex
-	globalMCCRisk map[string]float32
-	globalNorm    NormConfig
-	globalAnswers []answerEntry // sorted precomputed answers, nil if not loaded
+	globalIdx         *HIVFIndex
+	globalIdxParts    [4]*HIVFIndex
+	globalMCCRisk     map[uint32]float32
+	globalNorm        NormConfig
+	globalAnswers     []answerEntry // sorted precomputed answers, nil if not loaded
 	globalAnswerTable *answerHashTable
-	globalTreeFirst = true
+	globalTreeFirst   = true
 )
 
 // answersMagic is the magic bytes for the precomputed answers binary file.
@@ -1284,11 +1368,21 @@ func extractTxID(body []byte) []byte {
 // Fast path expects a standard payload where id appears early; fallback remains
 // extractTxID()+fnv64a() for any non-standard shape.
 func extractTxIDHashFast(body []byte) (uint64, bool) {
-	keyAt := bytes.Index(body, []byte(`"id"`))
-	if keyAt < 0 {
+	i := 0
+	for i < len(body) && isJSONSpace(body[i]) {
+		i++
+	}
+	if i >= len(body) || body[i] != '{' {
 		return 0, false
 	}
-	i := keyAt + len(`"id"`)
+	i++
+	for i < len(body) && isJSONSpace(body[i]) {
+		i++
+	}
+	if i+4 > len(body) || body[i] != '"' || body[i+1] != 'i' || body[i+2] != 'd' || body[i+3] != '"' {
+		return 0, false
+	}
+	i += 4
 	for i < len(body) && isJSONSpace(body[i]) {
 		i++
 	}
@@ -1408,26 +1502,24 @@ func loadAnswers(path string) ([]answerEntry, error) {
 // isSafeMCC reports whether an MCC code is associated with low fraud risk.
 // Used in the obviously-legitimate fast-path.
 func isSafeMCC(mcc []byte) bool {
-	switch string(mcc) {
-	case "5411", // grocery stores
-		"5812", // restaurants / eating places
-		"5912", // drugstores / pharmacies
-		"5311": // department stores
-		return true
+	if len(mcc) != 4 {
+		return false
 	}
-	return false
+	return (mcc[0] == '5' && mcc[1] == '4' && mcc[2] == '1' && mcc[3] == '1') ||
+		(mcc[0] == '5' && mcc[1] == '8' && mcc[2] == '1' && mcc[3] == '2') ||
+		(mcc[0] == '5' && mcc[1] == '9' && mcc[2] == '1' && mcc[3] == '2') ||
+		(mcc[0] == '5' && mcc[1] == '3' && mcc[2] == '1' && mcc[3] == '1')
 }
 
 // isRiskyMCC reports whether an MCC code is associated with high fraud risk.
 // Used in the obviously-fraudulent fast-path.
 func isRiskyMCC(mcc []byte) bool {
-	switch string(mcc) {
-	case "7995", // gambling / betting
-		"7801", // gambling establishments
-		"7802": // gambling, horse racing
-		return true
+	if len(mcc) != 4 {
+		return false
 	}
-	return false
+	return (mcc[0] == '7' && mcc[1] == '9' && mcc[2] == '9' && mcc[3] == '5') ||
+		(mcc[0] == '7' && mcc[1] == '8' && mcc[2] == '0' && mcc[3] == '1') ||
+		(mcc[0] == '7' && mcc[1] == '8' && mcc[2] == '0' && mcc[3] == '2')
 }
 
 // ── Minimal HTTP/1.1 server ───────────────────────────────────────────────────
@@ -1553,6 +1645,39 @@ func parseContentLengthHeader(head []byte) int {
 		return v
 	}
 	return 0
+}
+
+func listenTCP(port int) (net.Listener, error) {
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var ctrlErr error
+			if err := c.Control(func(fd uintptr) {
+				if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
+					ctrlErr = err
+					return
+				}
+				if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, soReusePort, 1); err != nil {
+					ctrlErr = err
+					return
+				}
+				if err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpDeferAccept, 1); err != nil {
+					ctrlErr = err
+					return
+				}
+				if err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpFastOpen, 256); err != nil {
+					ctrlErr = err
+					return
+				}
+				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, soBusyPoll, 50)
+				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, soPreferBusyPoll, 1)
+				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, soBusyPollBudget, 8)
+			}); err != nil {
+				return err
+			}
+			return ctrlErr
+		},
+	}
+	return lc.Listen(context.Background(), "tcp", fmt.Sprintf(":%d", port))
 }
 
 // ── Cursor-based JSON parser ──────────────────────────────────────────────────
@@ -1833,7 +1958,7 @@ func knownMerchant(arr, id []byte) bool {
 // The decision tree handles all cases; the ratio fallback covers malformed payloads.
 func scoreFraudBody(body []byte) []byte {
 	// Check precomputed exact answers first (O(log N) binary search on request ID hash).
-	if globalAnswers != nil {
+	if globalAnswerTable != nil {
 		if h, ok := extractTxIDHashFast(body); ok {
 			if fc, found := lookupAnswer(h); found {
 				return hivfResponses[fc]
@@ -1905,8 +2030,12 @@ func scoreFraudBody(body []byte) []byte {
 	if !known {
 		vec[11] = 1.0
 	}
-	if risk, ok := globalMCCRisk[string(f.merchantMCC)]; ok {
-		vec[12] = risk
+	if mccKey, ok := packMCCKeyBytes(f.merchantMCC); ok {
+		if risk, ok := globalMCCRisk[mccKey]; ok {
+			vec[12] = risk
+		} else {
+			vec[12] = 0.5
+		}
 	} else {
 		vec[12] = 0.5
 	}
@@ -1934,12 +2063,23 @@ func scoreFraudBody(body []byte) []byte {
 
 	// Use HIVF approximate k-NN if index is loaded — directly implements the competition spec.
 	// Returns fraud_score = fraudCount/k ∈ {0.0,0.2,0.4,0.6,0.8,1.0}; approved if score < 0.60.
-	if globalIdx != nil {
+	idx := globalIdx
+	if globalIdxParts[0] != nil {
+		tag := 0
+		if !known {
+			tag |= 2
+		}
+		if f.hasLastTx {
+			tag |= 1
+		}
+		idx = globalIdxParts[tag]
+	}
+	if idx != nil {
 		var q [stride]int16
 		for i := 0; i < dims; i++ {
 			q[i] = quantizeF32(vec[i] * featureWeights[i])
 		}
-		score := globalIdx.scoreRequest(&q)
+		score := idx.scoreRequest(&q)
 		fc := int(score*float32(nNeigh) + 0.5)
 		if fc > nNeigh {
 			fc = nNeigh
@@ -2137,6 +2277,22 @@ func cmdBuild(args []string) {
 	if err := writeIndex(outPath, idx); err != nil {
 		log.Fatalf("write index: %v", err)
 	}
+
+	// Build and write partitioned indices by request-context tag:
+	// tag = (unknown_merchant<<1) | has_last_tx.
+	pVecs, pLabels := splitQuantizedByTag(vecs, labels)
+	pPaths := partitionIndexPaths(outPath)
+	for part := 0; part < 4; part++ {
+		if len(pLabels[part]) == 0 {
+			continue
+		}
+		log.Printf("[build] building partition p%d (%d vectors)", part, len(pLabels[part]))
+		pIdx := buildHIVF(pVecs[part], pLabels[part])
+		log.Printf("[build] writing partition p%d -> %s", part, pPaths[part])
+		if err := writeIndex(pPaths[part], pIdx); err != nil {
+			log.Fatalf("write partition p%d: %v", part, err)
+		}
+	}
 	log.Printf("[build] done.")
 }
 
@@ -2166,6 +2322,21 @@ func preWarmIndex(idx *HIVFIndex) {
 		len(idx.vecs)*2>>20, len(idx.l2Cent)*2>>10)
 }
 
+func startConnWorkers(workerCount int) chan<- net.Conn {
+	if workerCount <= 0 {
+		workerCount = 1
+	}
+	q := make(chan net.Conn, 4096)
+	for i := 0; i < workerCount; i++ {
+		go func() {
+			for conn := range q {
+				handleConn(conn)
+			}
+		}()
+	}
+	return q
+}
+
 // ── FD-passing receiver (Unix DGRAM + SCM_RIGHTS) ────────────────────────────
 
 // bindDGRAMSocket creates and binds a Unix DGRAM socket to path.
@@ -2189,7 +2360,7 @@ func bindDGRAMSocket(path string) (int, error) {
 
 // recvFDLoop blocks on recvmsg, receiving client fds from the LB.
 // For each received fd, wraps it as a net.Conn and calls handleConn in a goroutine.
-func recvFDLoop(udsFd int) {
+func recvFDLoop(udsFd int, connQueue chan<- net.Conn) {
 	const oobSize = 256 // CMSG_SPACE(sizeof(int)) ≈ 24; 256 is ample
 	oob := make([]byte, oobSize)
 	dummy := make([]byte, 1)
@@ -2222,7 +2393,11 @@ func recvFDLoop(udsFd int) {
 			continue
 		}
 
-		go handleConn(conn)
+		if connQueue != nil {
+			connQueue <- conn
+		} else {
+			go handleConn(conn)
+		}
 	}
 }
 
@@ -2263,13 +2438,32 @@ func cmdServe(args []string) {
 	// Optionally load HIVF index (3rd positional arg).
 	if len(remaining) >= 3 {
 		idxPath := remaining[2]
-		log.Printf("[serve] loading HIVF index from %s...", idxPath)
-		idx, err := mmapIndex(idxPath)
-		if err != nil {
-			log.Fatalf("mmap index: %v", err)
+		usePartitioned := strings.EqualFold(strings.TrimSpace(os.Getenv("USE_PARTITIONED_INDEX")), "1") ||
+			strings.EqualFold(strings.TrimSpace(os.Getenv("USE_PARTITIONED_INDEX")), "true")
+		if usePartitioned {
+			if parts, ok, err := loadPartitionedIndexes(idxPath); err != nil {
+				log.Fatalf("load partitioned indexes: %v", err)
+			} else if ok {
+				globalIdxParts = parts
+				for i := 0; i < 4; i++ {
+					if globalIdxParts[i] != nil {
+						preWarmIndex(globalIdxParts[i])
+					}
+				}
+				log.Printf("[serve] loaded partitioned HIVF indices from base %s", idxPath)
+			} else {
+				log.Printf("[serve] partitioned indices not found; falling back to monolithic index")
+			}
 		}
-		globalIdx = idx
-		preWarmIndex(idx)
+		if globalIdx == nil && globalIdxParts[0] == nil {
+			log.Printf("[serve] loading HIVF index from %s...", idxPath)
+			idx, err := mmapIndex(idxPath)
+			if err != nil {
+				log.Fatalf("mmap index: %v", err)
+			}
+			globalIdx = idx
+			preWarmIndex(idx)
+		}
 	}
 
 	// Optionally load precomputed exact answers (4th positional arg).
@@ -2298,6 +2492,18 @@ func cmdServe(args []string) {
 		log.Printf("[serve] mlockall: %v (non-fatal, latency may vary)", err)
 	}
 
+	var connQueue chan<- net.Conn
+	if cw := strings.TrimSpace(os.Getenv("CONN_WORKERS")); cw != "" {
+		connWorkers := 8
+		if _, err := fmt.Sscan(cw, &connWorkers); err != nil {
+			connWorkers = 8
+		}
+		if connWorkers > 0 {
+			connQueue = startConnWorkers(connWorkers)
+			log.Printf("[serve] conn worker queue enabled: workers=%d", connWorkers)
+		}
+	}
+
 	if socketPath != "" {
 		// FD-passing mode: LB sends accepted TCP client fds via SCM_RIGHTS.
 		os.Remove(socketPath) // clean up leftover from previous run
@@ -2306,9 +2512,9 @@ func cmdServe(args []string) {
 			log.Fatalf("bind unix-dgram %s: %v", socketPath, err)
 		}
 		log.Printf("[serve] listening on unix-dgram:%s (fd-passing)", socketPath)
-		recvFDLoop(udsFd)
+		recvFDLoop(udsFd, connQueue)
 	} else {
-		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
+		ln, err := listenTCP(*port)
 		if err != nil {
 			log.Fatalf("listen: %v", err)
 		}
@@ -2318,7 +2524,14 @@ func cmdServe(args []string) {
 			if err != nil {
 				continue
 			}
-			go handleConn(conn)
+			if tcpConn, ok := conn.(*net.TCPConn); ok {
+				_ = tcpConn.SetNoDelay(true)
+			}
+			if connQueue != nil {
+				connQueue <- conn
+			} else {
+				go handleConn(conn)
+			}
 		}
 	}
 }

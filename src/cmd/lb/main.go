@@ -26,6 +26,11 @@ import (
 // SO_REUSEPORT is not exported by syscall on all Go/Linux builds;
 // hardcode the Linux value (0xf = 15) which is stable across all archs.
 const soReusePort = 0xf
+const soBusyPoll = 0x2e
+const soPreferBusyPoll = 0x45
+const soBusyPollBudget = 0x46
+const tcpDeferAccept = 0x9
+const tcpFastOpen = 0x17
 
 func main() {
 	log.SetFlags(log.Ltime | log.Lmsgprefix)
@@ -58,6 +63,15 @@ func main() {
 	if err := syscall.SetsockoptInt(listenFd, syscall.SOL_SOCKET, soReusePort, 1); err != nil {
 		log.Fatalf("[lb] SO_REUSEPORT: %v", err)
 	}
+	if err := syscall.SetsockoptInt(listenFd, syscall.IPPROTO_TCP, tcpDeferAccept, 1); err != nil {
+		log.Fatalf("[lb] TCP_DEFER_ACCEPT: %v", err)
+	}
+	if err := syscall.SetsockoptInt(listenFd, syscall.IPPROTO_TCP, tcpFastOpen, 256); err != nil {
+		log.Fatalf("[lb] TCP_FASTOPEN: %v", err)
+	}
+	_ = syscall.SetsockoptInt(listenFd, syscall.SOL_SOCKET, soBusyPoll, 50)
+	_ = syscall.SetsockoptInt(listenFd, syscall.SOL_SOCKET, soPreferBusyPoll, 1)
+	_ = syscall.SetsockoptInt(listenFd, syscall.SOL_SOCKET, soBusyPollBudget, 8)
 	sa := &syscall.SockaddrInet4{Port: 9999}
 	if err := syscall.Bind(listenFd, sa); err != nil {
 		log.Fatalf("[lb] bind :9999: %v", err)
@@ -153,4 +167,3 @@ const resp503 = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnec
 func send503(fd int) {
 	syscall.Write(fd, []byte(resp503)) //nolint
 }
-
