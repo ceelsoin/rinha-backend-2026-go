@@ -1,4 +1,4 @@
-IMAGE      := ceelsoinacio/rinha-backend-2026:v12
+IMAGE      := ceelsoinacio/rinha-backend-2026:v13
 LOCAL_IMAGE := rinha-local:latest
 
 build:
