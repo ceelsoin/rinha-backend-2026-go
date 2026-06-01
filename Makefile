@@ -44,6 +44,7 @@ local-fulltest: local-build
 	done
 	docker compose -f test/docker-compose.yml --profile test up --abort-on-container-exit
 	RINHA_IMAGE=$(LOCAL_IMAGE) docker compose down -v
+	make result
 
 # Run full k6 test via Docker (Linux-compatible; on macOS use local-test instead)
 test:
